@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main-window",
+  "description": "本地工作台窗口，仅启用文件对话框和必要的窗口事件。",
+  "windows": ["main"],
+  "permissions": ["core:default", "core:window:allow-destroy", "dialog:allow-open", "dialog:allow-save"]
+}

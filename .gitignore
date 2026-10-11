@@ -1,94 +1,32 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-build/
-develop-eggs/
+# Dependencies, toolchains and builds
+node_modules/
+.tools/
+.cache/
+.cargo-home/
 dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-pip-wheel-metadata/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
-# Virtual Environment
-venv/
-env/
-ENV/
-.venv/
-.env/
-tasks_storage
-# IDEs
+release/
+src-tauri/target/
+src-tauri/gen/
+
+# Local workspaces, input data and generated test suites
+data/
+test_datasets/
+tests/generated/
+test-results/
+playwright-report/
+
+# Local settings and temporary files
+.env*
+!.env.example
 .vscode/
 .idea/
-*.swp
-*.swo
-
-# Flask
-instance/
-.webassets-cache
-
-# Application specific files
-uploads/
-results/
-logs/
+__pycache__/
+*.py[cod]
 *.log
-
-# OS specific
-.DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
-Thumbs.db
-desktop.ini
-
-# Temporary files
 *.tmp
-*.temp
 *.bak
-*.backup
-
-# Environment variables
-.env
-.env.local
-.env.development.local
-.env.test.local
-.env.production.local
-
-# Excel temporary files
 ~$*.xlsx
 ~$*.xls
-
-# Coverage reports
-htmlcov/
-.coverage
-.coverage.*
-coverage.xml
-*.cover
-*.py,cover
-.hypothesis/
-.pytest_cache/
-
-# Documentation
-docs/_build/
-
-# Node modules (if any frontend dependencies)
-node_modules/
-
-# Config files that might contain sensitive info
-config_local.py
-excel_tool/app.spec
-tasks_storage
+.DS_Store
+Thumbs.db
+desktop.ini

@@ -1,0 +1,40 @@
+{
+  "name": "gridflow",
+  "version": "2.0.0",
+  "description": "汇格 · GridFlow - 本地 Excel / CSV 表格合并与数据分析工作台",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "tsc --noEmit && vite build",
+    "tauri": "tauri",
+    "desktop": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/dev.ps1",
+    "package": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package.ps1",
+    "types": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/native.ps1 run --manifest-path src-tauri/Cargo.toml --no-default-features --bin generate-types",
+    "test:core": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/native.ps1 test --manifest-path src-tauri/Cargo.toml --no-default-features",
+    "test": "vitest run",
+    "test:ui": "playwright test",
+    "release": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package.ps1"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.8.0",
+    "@tauri-apps/plugin-dialog": "^2.4.0",
+    "ag-grid-community": "^34.3.0",
+    "ag-grid-react": "^34.3.0",
+    "echarts": "^6.0.0",
+    "lucide-react": "^0.545.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "ssf": "0.11.2"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.56.0",
+    "@tauri-apps/cli": "^2.8.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "typescript": "^5.9.0",
+    "vite": "^7.1.0",
+    "vitest": "^3.2.0"
+  }
+}

@@ -1,0 +1,54 @@
+[package]
+name = "excel-workbench"
+version = "2.0.0"
+edition = "2021"
+default-run = "excel-workbench"
+
+[lib]
+name = "excel_workbench"
+crate-type = ["lib"]
+
+[features]
+default = ["desktop"]
+desktop = ["dep:tauri", "dep:tauri-plugin-dialog", "dep:tauri-plugin-single-instance"]
+custom-protocol = ["desktop", "tauri/custom-protocol"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [], optional = true }
+tauri-plugin-dialog = { version = "2", optional = true }
+tauri-plugin-single-instance = { version = "2", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ts-rs = { version = "11", features = ["serde-compat"] }
+duckdb = { version = "=1.10506.0", features = ["chrono"] }
+calamine = { version = "0.31", features = ["chrono"] }
+csv = "1.3"
+encoding_rs = "0.8"
+chardetng = "0.1"
+rust_xlsxwriter = { version = "0.90", features = ["constant_memory"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+zip = { version = "4", default-features = false, features = ["deflate"] }
+quick-xml = "=0.38.4"
+cfb = "=0.14.0"
+argon2 = "0.5"
+rand_core = { version = "0.6", features = ["getrandom"] }
+sysinfo = "0.37"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+strip = true
+
+[[bin]]
+name = "generate-types"
+path = "src/bin/generate_types.rs"
+
+[[bin]]
+name = "benchmark"
+path = "src/bin/benchmark.rs"
