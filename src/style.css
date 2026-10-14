@@ -703,6 +703,12 @@ strong {
   padding: 2px;
   color: #8c9bb2;
 }
+.column-rule-head .column-drag-handle { flex-shrink: 0; cursor: grab; touch-action: none; }
+.column-rule-head .column-drag-handle:active { cursor: grabbing; }
+.column-rule-head .column-drag-handle:disabled { cursor: default; }
+.column-dragging { opacity: .5; }
+.column-drop-before { box-shadow: inset 0 2px #2563eb; }
+.column-drop-after { box-shadow: inset 0 -2px #2563eb; }
 .advanced {
   margin: 12px 0;
   font-size: 12px;

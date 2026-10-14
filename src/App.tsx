@@ -58,6 +58,7 @@ import {
 import rewardQrCode from "./assets/reward_qr.webp";
 import appIcon from "./assets/app_icon.png";
 import { Button, Modal, Grid, StaticGrid } from "./components";
+import { OutputColumnList } from "./OutputColumnList";
 import { formatChanges, formatPurpose } from "./review";
 import ExcelPreview, { rangeLabel } from "./ExcelPreview";
 import SourceFileList from "./SourceFileList";
@@ -815,11 +816,15 @@ export default function App() {
   }
   function moveColumn(key: string, direction: number) {
     const i = keptColumns.findIndex((c) => c.key === key);
-    const j = i + direction;
-    if (i < 0 || j < 0 || j >= keptColumns.length) return;
+    reorderColumn(key, i + direction);
+  }
+  function reorderColumn(key: string, index: number) {
+    const i = keptColumns.findIndex((c) => c.key === key);
+    if (i < 0 || index < 0 || index >= keptColumns.length || i === index) return;
     edit((r) => {
       const next = [...keptColumns];
-      [next[i], next[j]] = [next[j], next[i]];
+      const [column] = next.splice(i, 1);
+      next.splice(index, 0, column);
       r.columns = [...next, ...removedColumns];
       return r;
     });
@@ -1937,12 +1942,13 @@ export default function App() {
                 <>
                   <div className="panel-heading">
                     <h3>汇总表要保留哪些列？</h3>
-                    <p>直接改列名，用箭头排序；不需要的列点“移除”，格式设置按需展开。</p>
+                    <p>按住左侧手柄拖动排序，也可用箭头调整；不需要的列点“移除”。</p>
                   </div>
                   <p className="column-count">保留 {keptColumns.length} 列{removedColumns.length ? ` · 已移除 ${removedColumns.length} 列` : ""}</p>
-                  {keptColumns.map((col, i) => (
-                    <div className="column-rule" key={col.key}>
+                  <OutputColumnList columns={keptColumns} onMove={reorderColumn}>{(col, i, handle) => (
+                    <>
                       <div className="column-rule-head">
+                        {handle}
                         <span className="column-position" aria-hidden="true">{i + 1}</span>
                         <input className="column-name" aria-label={`列名 ${col.name}`} value={col.name} onChange={(e) => updateColumn(col.key, { name: e.target.value })} />
                         <button title="上移" aria-label={`${col.name} 上移`} disabled={i === 0} onClick={() => moveColumn(col.key, -1)}><ArrowUp size={13} /></button>
@@ -1958,8 +1964,8 @@ export default function App() {
                           <option value="auto">自动识别；不能确定时保留原值</option><option value="ymd">年月日</option><option value="dmy">日月年</option><option value="mdy">月日年</option>
                         </select></label>}
                       </details>
-                    </div>
-                  ))}
+                    </>
+                  )}</OutputColumnList>
                   {columns.length > 0 && !keptColumns.length && <p className="empty-note">所有输出列均已移除，请恢复需要的列后再汇总。</p>}
                   {removedColumns.length > 0 && <details className="removed-columns">
                     <summary>已移除的列（{removedColumns.length}）· 可恢复</summary>
