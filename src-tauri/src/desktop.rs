@@ -171,6 +171,11 @@ async fn export_analysis(core: Core<'_>, spec: PivotSpec, path: String) -> Resul
         .map_err(join_error)?
 }
 #[tauri::command]
+async fn export_workbook(core: Core<'_>, queries: Vec<DatasetQuery>, path: String) -> Result<String> {
+    let core = core.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || core.export_workbook(queries, path)).await.map_err(join_error)?
+}
+#[tauri::command]
 async fn export_batch(
     core: Core<'_>,
     ids: Vec<String>,
@@ -186,8 +191,11 @@ async fn export_batch(
     .map_err(join_error)?
 }
 #[tauri::command]
-fn save_image(core: Core<'_>, path: String, bytes: Vec<u8>) -> Result<String> {
-    core.save_image(path, bytes)
+fn save_image(core: Core<'_>, path: String, bytes: Vec<u8>, dataset_id: Option<String>) -> Result<String> {
+    if let Some(id) = &dataset_id { core.dataset(id)?; }
+    let saved = core.save_image(path, bytes)?;
+    if let Some(id) = dataset_id { core.record_export(&id, &PathBuf::from(&saved))?; }
+    Ok(saved)
 }
 #[tauri::command]
 async fn delete_items(core: Core<'_>, kind: String, ids: Vec<String>) -> Result<()> {
@@ -361,6 +369,7 @@ pub fn run() {
             import_results,
             export_dataset,
             export_analysis,
+            export_workbook,
             export_batch,
             save_image,
             delete_items,

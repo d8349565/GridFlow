@@ -9,9 +9,12 @@ fn csv_file(root: &Path, name: &str, contents: &str) -> String {
     path.to_string_lossy().into()
 }
 fn rules_for(engine: &Engine) -> RuleSet {
-    let mut rules = engine.snapshot().unwrap().rules;
+    let ws = engine.snapshot().unwrap();
+    let mut rules = ws.rules;
+    rules.merge_mode = Some("single".into());
     for source in &mut rules.sources {
         source.header_row = 1;
+        source.enabled = ws.files.iter().flat_map(|f| &f.sheets).any(|s| s.id == source.sheet_id && s.width > 0);
     }
     rules
 }
@@ -84,7 +87,7 @@ fn multirow_header_range_styles_fixed_values_and_schemes() {
     let mut rules=ws.rules;
     for source in &mut rules.sources { source.header_row=5;source.header_range=Some(area.clone()); }
     rules.include_source=false;
-    rules.fixed_cells.push(FixedCellRule { id:"shop".into(),name:"门店名称".into(),sheet_name:"销售".into(),address:"B2".into() });
+    rules.fixed_cells.push(FixedCellRule { id:"shop".into(),name:"门店名称".into(),sheet_name:"销售".into(),address:"B2".into(),target_sheets:vec![] });
     rules.columns.push(numeric("收入 / 金额"));
     let cols=engine.input_columns(&rules).unwrap();
     assert_eq!(cols.iter().map(|c|c.name.as_str()).collect::<Vec<_>>(),vec!["门店编号","收入 / 金额","收入 / 数量"]);
@@ -205,6 +208,7 @@ fn same_display_source_keeps_fixed_cells_separate_after_hiding_and_rename() {
         name: "部门".into(),
         sheet_name: "数据".into(),
         address: "A1".into(),
+        target_sheets: vec![],
     }];
     rules.columns = vec![
         ColumnRule {
@@ -542,6 +546,7 @@ fn fixed_cell_formula_issues_missing_sheets_and_cleanup() {
         name: "固定公式".into(),
         sheet_name: "信息".into(),
         address: "A1".into(),
+        target_sheets: vec![],
     });
     let ds = publish(&engine, rules.clone());
     let issue = engine.issues(&ds.id, 0).unwrap();
@@ -550,13 +555,9 @@ fn fixed_cell_formula_issues_missing_sheets_and_cleanup() {
     assert_eq!(issue[0].row, 1);
     assert_eq!(issue[0].source_column, 1);
     rules.fixed_cells[0].sheet_name = "不存在".into();
-    assert_eq!(
-        engine
-            .process(&rules, false, &AtomicBool::new(false), |_, _| {})
-            .unwrap_err()
-            .code,
-        "MISSING_SHEET"
-    );
+    let missing = engine.process(&rules, false, &AtomicBool::new(false), |_, _| {}).unwrap();
+    assert_eq!(missing.summary.output_rows, ds.summary.output_rows);
+    assert_eq!(missing.summary.issue_count, 1);
     engine.delete_items("datasets", &[ds.id.clone()]).unwrap();
     assert_eq!(engine.query(query(&ds.id)).unwrap_err().code, "NOT_FOUND");
     engine.delete_items("files", &[file.id]).unwrap();

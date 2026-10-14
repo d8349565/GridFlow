@@ -11,6 +11,46 @@ use std::{
 };
 
 impl Engine {
+    pub fn export_workbook(&self, queries: Vec<DatasetQuery>, path: String) -> Result<String> {
+        self.guard()?;
+        let _gate = self.heavy.lock().unwrap();
+        let path = PathBuf::from(path);
+        if queries.is_empty() || !path.extension().is_some_and(|v| v.eq_ignore_ascii_case("xlsx")) {
+            return Err(AppError::new("EXPORT", "请选择结果并保存为 .xlsx 文件"));
+        }
+        let temp = temporary(&path)?;
+        let conn = self.conn()?;
+        let mut names = std::collections::HashSet::from(["history".to_string()]);
+        let mut exported = Vec::new();
+        let result = (|| {
+            let mut book = Workbook::new();
+            for query in queries {
+                let ds = self.dataset(&query.dataset_id)?;
+                let indices = visible(&ds);
+                if indices.is_empty() { return Err(AppError::new("COLUMN", format!("{} 没有可导出的列", ds.name))); }
+                let (condition, args) = conditions(&ds, &query)?;
+                let selection = indices.iter().flat_map(|i| [format!("c{i}"), format!("t{i}")]).collect::<Vec<_>>().join(",");
+                let mut statement = conn.prepare(&format!("SELECT {selection} FROM d_{}{condition}{}", ds.id, order(&ds, &query)?))?;
+                let mut cursor = statement.query(params_from_iter(args))?;
+                let columns = indices.iter().map(|i| ds.columns[*i].clone()).collect::<Vec<_>>();
+                let name = worksheet_name(&ds.name, &mut names);
+                write_worksheet(&mut book, &name, &columns, || match cursor.next() {
+                    Ok(Some(row)) => Some((0..indices.len()).map(|i| cell_from_row(row, 2 * i)).collect::<Result<Vec<_>>>()),
+                    Ok(None) => None,
+                    Err(error) => Some(Err(error.into())),
+                })?;
+                exported.push(ds.id);
+            }
+            book.save(&temp).map_err(xlsx_error)?;
+            publish(&temp, &path)
+        })();
+        if let Err(error) = result {
+            let _ = std::fs::remove_file(&temp);
+            return Err(error);
+        }
+        for id in exported { self.record_export(&id, &path)?; }
+        Ok(path.to_string_lossy().into())
+    }
     pub fn export_dataset(&self, query: DatasetQuery, path: String) -> Result<String> {
         self.guard()?;
         let _gate = self.heavy.lock().unwrap();
@@ -96,7 +136,7 @@ impl Engine {
         let directory = PathBuf::from(directory);
         std::fs::create_dir_all(&directory)?;
         let mut paths = Vec::new();
-        for dataset_id in ids {
+        for dataset_id in &ids {
             let ds = self.dataset(&dataset_id)?;
             let name = format!(
                 "{}_{}.{}",
@@ -107,7 +147,7 @@ impl Engine {
             let path = directory.join(name);
             paths.push(self.export_dataset(
                 DatasetQuery {
-                    dataset_id,
+                    dataset_id: dataset_id.clone(),
                     limit: 100,
                     ..Default::default()
                 },
@@ -140,6 +180,7 @@ impl Engine {
                 let _ = std::fs::remove_file(temp);
                 return Err(error);
             }
+            for id in &ids { self.record_export(id, &path)?; }
             paths.push(zip_path);
         }
         Ok(paths)
@@ -182,73 +223,95 @@ fn write_rows(
         writer.flush()?;
     } else if format == "xlsx" {
         let mut book = Workbook::new();
-        let sheet = book.add_worksheet_with_constant_memory();
-        sheet.set_name("汇总数据").map_err(xlsx_error)?;
-        sheet.set_freeze_panes(1, 0).map_err(xlsx_error)?;
-        let header = Format::new().set_bold().set_background_color("#EFF6FF");
-        let date_format = Format::new().set_num_format("yyyy-mm-dd hh:mm:ss");
-        for (i, column) in columns.iter().enumerate() {
-            sheet
-                .write_string_with_format(0, i as u16, &column.name, &header)
-                .map_err(xlsx_error)?;
-            sheet.set_column_width(i as u16, 18).map_err(xlsx_error)?;
-        }
-        let mut number = 1u32;
-        while let Some(row) = next() {
-            if number >= 1_048_576 {
-                return Err(AppError::new(
-                    "EXCEL_LIMIT",
-                    "Excel 超过最大行数，请导出 CSV",
-                ));
-            }
-            for (i, cell) in row?.iter().enumerate() {
-                match cell {
-                    Cell::Empty => {}
-                    Cell::Text(text) => {
-                        sheet
-                            .write_string(number, i as u16, text)
-                            .map_err(xlsx_error)?;
-                    }
-                    Cell::Number(value) => {
-                        sheet
-                            .write_number(number, i as u16, *value)
-                            .map_err(xlsx_error)?;
-                    }
-                    Cell::Bool(value) => {
-                        sheet
-                            .write_boolean(number, i as u16, *value)
-                            .map_err(xlsx_error)?;
-                    }
-                    Cell::Date(value) => {
-                        let formatted = if value.len() == 10 {
-                            format!("{value}T00:00:00")
-                        } else {
-                            value.replace(' ', "T")
-                        };
-                        if let Ok(date) = ExcelDateTime::parse_from_str(&formatted) {
-                            sheet
-                                .write_datetime_with_format(number, i as u16, &date, &date_format)
-                                .map_err(xlsx_error)?;
-                        } else {
-                            sheet
-                                .write_string(number, i as u16, value)
-                                .map_err(xlsx_error)?;
-                        }
-                    }
-                }
-            }
-            number += 1;
-        }
-        if number > 1 && !columns.is_empty() {
-            sheet
-                .autofilter(0, 0, number - 1, columns.len() as u16 - 1)
-                .map_err(xlsx_error)?;
-        }
+        write_worksheet(&mut book, "汇总数据", columns, next)?;
         book.save(temp).map_err(xlsx_error)?;
     } else {
         return Err(AppError::new("EXPORT", "请使用 .xlsx 或 .csv 扩展名"));
     }
     Ok(())
+}
+fn write_worksheet(
+    book: &mut Workbook,
+    name: &str,
+    columns: &[Column],
+    mut next: impl FnMut() -> Option<Result<Vec<Cell>>>,
+) -> Result<()> {
+    if columns.len() > 16_384 { return Err(AppError::new("EXCEL_LIMIT", "Excel 超过最大列数，请减少输出列")); }
+    let sheet = book.add_worksheet_with_constant_memory();
+    sheet.set_name(name).map_err(xlsx_error)?;
+    sheet.set_freeze_panes(1, 0).map_err(xlsx_error)?;
+    let header = Format::new().set_bold().set_background_color("#EFF6FF");
+    let date_format = Format::new().set_num_format("yyyy-mm-dd hh:mm:ss");
+    for (i, column) in columns.iter().enumerate() {
+        sheet
+            .write_string_with_format(0, i as u16, &column.name, &header)
+            .map_err(xlsx_error)?;
+        sheet.set_column_width(i as u16, 18).map_err(xlsx_error)?;
+    }
+    let mut number = 1u32;
+    while let Some(row) = next() {
+        if number >= 1_048_576 {
+            return Err(AppError::new(
+                "EXCEL_LIMIT",
+                "Excel 超过最大行数，请导出 CSV",
+            ));
+        }
+        for (i, cell) in row?.iter().enumerate() {
+            match cell {
+                Cell::Empty => {}
+                Cell::Text(text) => {
+                    sheet
+                        .write_string(number, i as u16, text)
+                        .map_err(xlsx_error)?;
+                }
+                Cell::Number(value) => {
+                    sheet
+                        .write_number(number, i as u16, *value)
+                        .map_err(xlsx_error)?;
+                }
+                Cell::Bool(value) => {
+                    sheet
+                        .write_boolean(number, i as u16, *value)
+                        .map_err(xlsx_error)?;
+                }
+                Cell::Date(value) => {
+                    let formatted = if value.len() == 10 {
+                        format!("{value}T00:00:00")
+                    } else {
+                        value.replace(' ', "T")
+                    };
+                    if let Ok(date) = ExcelDateTime::parse_from_str(&formatted) {
+                        sheet
+                            .write_datetime_with_format(number, i as u16, &date, &date_format)
+                            .map_err(xlsx_error)?;
+                    } else {
+                        sheet
+                            .write_string(number, i as u16, value)
+                            .map_err(xlsx_error)?;
+                    }
+                }
+            }
+        }
+        number += 1;
+    }
+    if number > 1 && !columns.is_empty() {
+        sheet
+            .autofilter(0, 0, number - 1, columns.len() as u16 - 1)
+            .map_err(xlsx_error)?;
+    }
+    Ok(())
+}
+fn worksheet_name(name: &str, used: &mut std::collections::HashSet<String>) -> String {
+    let base = name.chars().map(|c| if "[]:*?/\\".contains(c) || c.is_control() { '_' } else { c })
+        .collect::<String>().trim().trim_matches('\'').to_string();
+    let base = if base.is_empty() { "汇总数据" } else { &base };
+    let mut number = 1;
+    loop {
+        let suffix = if number == 1 { String::new() } else { format!(" ({number})") };
+        let candidate = format!("{}{}", base.chars().take(31 - suffix.chars().count()).collect::<String>(), suffix);
+        if used.insert(candidate.to_lowercase()) { return candidate; }
+        number += 1;
+    }
 }
 fn csv_text(cell: &Cell) -> String {
     let text = cell.text();

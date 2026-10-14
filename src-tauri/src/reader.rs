@@ -209,7 +209,7 @@ pub fn business_key(name: &str) -> String {
     format!("input:{name}")
 }
 pub fn canonical_key(key: &str) -> String {
-    if key == "__source" || key.starts_with("fixed:") || key.starts_with("input:") {
+    if key == "__source" || key.starts_with("fixed:") || key.starts_with("lookup:") || key.starts_with("input:") {
         key.into()
     } else {
         business_key(key)

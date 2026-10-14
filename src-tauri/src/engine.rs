@@ -1,4 +1,4 @@
-use crate::{model::*, reader};
+use crate::{model::*, reader, workflow};
 use argon2::{
     password_hash::{PasswordHash, SaltString},
     Argon2, PasswordHasher, PasswordVerifier,
@@ -24,6 +24,15 @@ pub struct Engine {
     pub(crate) heavy: Mutex<()>,
     unlocked: AtomicBool,
 }
+struct LookupIndex<'a> {
+    rule: &'a LookupRule,
+    source_column: usize,
+    sheet: &'a SourceSheet,
+    value_column: usize,
+    values: HashMap<String, (Cell, usize)>,
+}
+type FixedValue = (Cell, String, usize, usize, String, Option<String>);
+type FixedCache = HashMap<(String, String, String), FixedValue>;
 impl Engine {
     pub fn open(root: &Path) -> Result<Arc<Self>> {
         std::fs::create_dir_all(root.join("imports"))?;
@@ -39,7 +48,9 @@ impl Engine {
         let mut workspace = if let Some(saved) = saved {
             serde_json::from_str::<Workspace>(&saved)?
         } else {
-            Workspace::default()
+            let mut workspace = Workspace::default();
+            workspace.rules.merge_mode = Some("bySheet".into());
+            workspace
         };
         // 兼容开发期间已有的 v2 数据表；保留原文本，并补充独立数值投影。
         for dataset in &workspace.datasets {
@@ -61,6 +72,7 @@ impl Engine {
                     task.dataset_id = None;
                 }
             }
+            task.dataset_ids.retain(|id| workspace.datasets.iter().any(|d| &d.id == id));
         }
         workspace.data_directory = root.to_string_lossy().into();
         workspace.locked = workspace.settings.password_hash.is_some();
@@ -128,6 +140,7 @@ impl Engine {
             });
         }
         let mut copy = ws.clone();
+        copy.rules = workflow::normalize(copy.rules, &copy.files);
         copy.settings.password_hash = ws.settings.password_hash.as_ref().map(|_| "enabled".into());
         copy.locked = false;
         Ok(copy)
@@ -135,7 +148,7 @@ impl Engine {
     pub fn save_draft(&self, rules: RuleSet, active_sheet_id: Option<String>) -> Result<()> {
         self.guard()?;
         let mut ws = self.workspace.lock().unwrap();
-        let mut rules = rules;
+        let mut rules = workflow::normalize(rules, &ws.files);
         let valid = ws
             .files
             .iter()
@@ -143,6 +156,17 @@ impl Engine {
             .map(|s| s.id.clone())
             .collect::<HashSet<_>>();
         rules.sources.retain(|s| valid.contains(&s.sheet_id));
+        for output in &mut rules.output_sheets {
+            if rules.merge_mode.as_deref() == Some("bySheet") { output.rules.sources.clear(); continue; }
+            output.rules.sources.retain(|s| valid.contains(&s.sheet_id));
+            for source in &rules.sources {
+                if !output.rules.sources.iter().any(|s| s.sheet_id == source.sheet_id) {
+                    let mut source = source.clone();
+                    source.enabled = false;
+                    output.rules.sources.push(source);
+                }
+            }
+        }
         for file in &ws.files {
             for sheet in &file.sheets {
                 if !rules.sources.iter().any(|s| s.sheet_id == sheet.id) {
@@ -156,7 +180,7 @@ impl Engine {
                 }
             }
         }
-        ws.rules = rules;
+        ws.rules = workflow::normalize(rules, &ws.files);
         ws.active_sheet_id = active_sheet_id.filter(|id| valid.contains(id));
         self.persist_locked(&ws)
     }
@@ -222,6 +246,12 @@ impl Engine {
             } else {
                 expanded.push(path);
             }
+        }
+        let mut seen = HashSet::new();
+        expanded.retain(|path| seen.insert(std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path))));
+        expanded.retain(|path| !Path::new(path).file_name().is_some_and(|name| name.to_string_lossy().starts_with("~$")));
+        if expanded.is_empty() {
+            return Err(AppError::new("IMPORT", "所选文件夹中没有 Excel / CSV 文件（仅读取文件夹内的文件）"));
         }
         let total: u64 = expanded
             .iter()
@@ -373,20 +403,29 @@ SPU-201,精品挂耳咖啡包,咖啡周边,220,68,14960,2
         match result {
             Ok(file) => {
                 let mut ws = self.workspace.lock().unwrap();
+                let first = file.sheets.iter().find(|s| s.width > 0 && s.rows > 0).map(|s| &s.id);
                 for sheet in &file.sheets {
                     ws.rules.sources.push(SourceSelection {
                         sheet_id: sheet.id.clone(),
-                        enabled: sheet.width > 0,
+                        enabled: Some(&sheet.id) == first,
                         header_row: 1,
                         header_range: None,
                         source_name: format!("{} / {}", file.name, sheet.name),
                     });
+                }
+                ws.rules.file_selections.push(FileSelection { file_id: file.id.clone(), enabled: true });
+                if workflow::mode(&ws.rules) == "legacy" {
+                    let new_sources = ws.rules.sources.iter().filter(|s| file.sheets.iter().any(|sheet| sheet.id == s.sheet_id)).cloned().collect::<Vec<_>>();
+                    for output in &mut ws.rules.output_sheets {
+                        for mut source in new_sources.clone() { source.enabled = false; output.rules.sources.push(source); }
+                    }
                 }
                 if ws.active_sheet_id.is_none() {
                     ws.active_sheet_id = file.sheets.first().map(|s| s.id.clone());
                 }
                 activity(&mut ws, "导入文件", &file.name);
                 ws.files.push(file.clone());
+                ws.rules = workflow::normalize(ws.rules.clone(), &ws.files);
                 self.persist_locked(&ws)?;
                 Ok(file)
             }
@@ -559,6 +598,20 @@ SPU-201,精品挂耳咖啡包,咖啡周边,220,68,14960,2
                 suggested_type: ColumnType::Text,
             });
         }
+        for rule in &rules.lookup_columns {
+            let reference = self.workspace.lock().unwrap().files.iter()
+                .find(|f| f.sheets.iter().any(|s| rules.sources.iter().any(|r| r.enabled && r.sheet_id == s.id)))
+                .and_then(|f| f.sheets.iter().find(|s| s.name == rule.sheet_name)).cloned();
+            let suggested_type = reference.and_then(|s| self.columns_at(&s, rule.header_row).ok())
+                .and_then(|cols| cols.into_iter().find(|c| reader::same_key(&c.key, &rule.value_key)))
+                .map(|c| c.suggested_type).unwrap_or(ColumnType::Auto);
+            columns.push(Column {
+                key: format!("lookup:{}", rule.id),
+                name: rule.name.clone(),
+                data_type: ColumnType::Auto,
+                suggested_type,
+            });
+        }
         if rules.include_source {
             columns.push(Column {
                 key: "__source".into(),
@@ -653,34 +706,18 @@ SPU-201,精品挂耳咖啡包,咖啡周边,220,68,14960,2
     pub fn save_scheme(&self, name: String, rules: RuleSet) -> Result<Scheme> {
         self.guard()?;
         let ws = self.workspace.lock().unwrap();
-        let sheets = rules
-            .sources
-            .iter()
-            .filter_map(|s| {
-                ws.files
-                    .iter()
-                    .find(|f| f.sheets.iter().any(|sheet| sheet.id == s.sheet_id))
-                    .and_then(|file| {
-                        file.sheets
-                            .iter()
-                            .find(|sheet| sheet.id == s.sheet_id)
-                            .map(|sheet| SheetPreset {
-                                name: sheet.name.clone(),
-                                header_row: s.header_row,
-                                header_range: s.header_range.clone(),
-                                enabled: s.enabled,
-                                workbook_sheets: file
-                                    .sheets
-                                    .iter()
-                                    .map(|s| s.name.clone())
-                                    .collect(),
-                            })
-                    })
-            })
-            .collect();
+        let files = ws.files.clone();
         drop(ws);
+        let sheets = sheet_presets(&files, &rules);
         let mut stored = rules;
+        for output in &mut stored.output_sheets {
+            if !output.rules.sources.is_empty() {
+                output.sheets = sheet_presets(&files, &output.rules);
+            }
+            output.rules.sources.clear();
+        }
         stored.sources.clear();
+        stored.file_selections.clear();
         let mut scheme = Scheme {
             id: id(),
             name: if name.trim().is_empty() {
@@ -731,68 +768,18 @@ SPU-201,精品挂耳咖啡包,咖啡周边,220,68,14960,2
             .iter()
             .find(|s| s.id == scheme_id)
             .ok_or_else(|| AppError::new("NOT_FOUND", "方案不存在"))?;
-        let selected_files = current
-            .sources
-            .iter()
-            .filter(|s| s.enabled)
-            .filter_map(|source| {
-                ws.files
-                    .iter()
-                    .find(|f| f.sheets.iter().any(|s| s.id == source.sheet_id))
-                    .map(|f| f.id.clone())
-            })
-            .collect::<HashSet<_>>();
-        let mut rules = scheme.rules.clone();
-        rules.sources = current.sources;
-        let mut missing = Vec::new();
-        if !scheme.sheets.is_empty() {
-            for source in &mut rules.sources {
-                if let Some(file) = ws
-                    .files
-                    .iter()
-                    .find(|f| f.sheets.iter().any(|s| s.id == source.sheet_id))
-                {
-                    let sheet = file
-                        .sheets
-                        .iter()
-                        .find(|s| s.id == source.sheet_id)
-                        .unwrap();
-                    if let Some(preset) = scheme
-                        .sheets
-                        .iter()
-                        .find(|p| p.name == sheet.name && preset_matches(file, p))
-                    {
-                        source.enabled = selected_files.contains(&sheet.file_id) && preset.enabled;
-                        source.header_row = preset.header_row;
-                        source.header_range = preset.header_range.clone();
-                    } else {
-                        source.enabled = false;
-                    }
-                }
-            }
-            for file in ws.files.iter().filter(|f| selected_files.contains(&f.id)) {
-                let applicable = scheme
-                    .sheets
-                    .iter()
-                    .filter(|p| preset_matches(file, p))
-                    .collect::<Vec<_>>();
-                if applicable.is_empty() {
-                    missing.push(format!("{} 的工作表结构不匹配", file.name));
-                }
-                for preset in applicable.into_iter().filter(|p| p.enabled) {
-                    if !file.sheets.iter().any(|s| s.name == preset.name) {
-                        missing.push(format!("{} 缺少 {}", file.name, preset.name));
-                    }
+        let current = workflow::normalize(current, &ws.files);
+        let selected_files = ws.files.iter().filter(|f| workflow::file_enabled(&current, &f.id)).map(|f| f.id.clone()).collect::<HashSet<_>>();
+        let mut rules = rules_from_presets(&ws.files, &scheme.rules, &scheme.sheets, &current.sources, &selected_files)?;
+        if workflow::mode(&scheme.rules) == "legacy" || scheme.rules.merge_mode.is_none() {
+            for output in &mut rules.output_sheets {
+                output.rules = rules_from_presets(&ws.files, &output.rules, &output.sheets, &current.sources, &selected_files)?;
+                for source in &mut output.rules.sources {
+                    source.enabled &= ws.files.iter().any(|f| selected_files.contains(&f.id) && f.sheets.iter().any(|s| s.id == source.sheet_id));
                 }
             }
         }
-        if !missing.is_empty() {
-            return Err(AppError::new(
-                "SCHEME_MISMATCH",
-                format!("方案无法完整匹配：{}", missing.join("；")),
-            ));
-        }
-        Ok(rules)
+        Ok(workflow::normalize(rules, &ws.files))
     }
     pub(crate) fn replace_scheme_sheets(
         &self,
@@ -819,7 +806,14 @@ SPU-201,精品挂耳咖啡包,咖啡周边,220,68,14960,2
     }
     pub fn submit(&self, rules: RuleSet) -> Result<Task> {
         self.guard()?;
+        let files = self.workspace.lock().unwrap().files.clone();
+        let mut rules = workflow::normalize(rules, &files);
+        workflow::validate_template(&rules, &files)?;
+        if workflow::mode(&rules) != "legacy" && rules.sources.iter().any(|source| source.enabled && !files.iter().flat_map(|f| &f.sheets).any(|sheet| sheet.id == source.sheet_id)) {
+            return Err(AppError::new("SOURCES", "所选来源表已移除，请重新导入或取消勾选后再汇总"));
+        }
         self.validate(&rules)?;
+        if workflow::mode(&rules) != "legacy" { rules.sources = workflow::execution(&rules, &files, None).sources; }
         if self.workspace.lock().unwrap().tasks.iter().any(|t| {
             matches!(
                 t.state,
@@ -840,6 +834,7 @@ SPU-201,精品挂耳咖啡包,咖啡周边,220,68,14960,2
             finished_at: None,
             error: None,
             dataset_id: None,
+            dataset_ids: vec![],
             rules,
         };
         self.cancelled
@@ -917,26 +912,28 @@ SPU-201,精品挂耳咖啡包,咖啡周边,220,68,14960,2
             t.state = TaskState::Running;
             t.phase = "准备处理".into();
         });
-        let result = self.process(&task.rules, false, &flag, |percent, message| {
+        let result = self.process_outputs(&task.rules, &flag, |percent, message| {
             self.update_task(task_id, |t| {
                 t.progress = percent;
                 t.phase = message.into();
             })
         });
         match result {
-            Ok(dataset) => {
+            Ok(datasets) => {
                 let mut ws = self.workspace.lock().unwrap();
-                ws.datasets.insert(0, dataset.clone());
+                let dataset_ids = datasets.iter().map(|d| d.id.clone()).collect::<Vec<_>>();
                 activity(
                     &mut ws,
                     "汇总完成",
-                    &format!("{} · {} 行", dataset.name, dataset.summary.output_rows),
+                    &format!("{} 张表 · {} 行", datasets.len(), datasets.iter().map(|d| d.summary.output_rows).sum::<usize>()),
                 );
+                ws.datasets.splice(0..0, datasets);
                 if let Some(task) = ws.tasks.iter_mut().find(|t| t.id == task_id) {
                     task.state = TaskState::Succeeded;
                     task.progress = 100;
                     task.phase = "处理完成，可以预览或导出".into();
-                    task.dataset_id = Some(dataset.id);
+                    task.dataset_id = dataset_ids.first().cloned();
+                    task.dataset_ids = dataset_ids;
                     task.finished_at = Some(now());
                 }
                 let _ = self.persist_locked(&ws);
@@ -954,13 +951,87 @@ SPU-201,精品挂耳咖啡包,咖啡周边,220,68,14960,2
         }
         self.cancelled.lock().unwrap().remove(task_id);
     }
+    fn process_outputs(&self, rules: &RuleSet, cancel: &AtomicBool, progress: impl Fn(u8, &str)) -> Result<Vec<Dataset>> {
+        let files = self.workspace.lock().unwrap().files.clone();
+        let mut fixed_cache = FixedCache::new();
+        if workflow::mode(rules) == "single" {
+            return self.process_cached(&workflow::execution(rules, &files, None), false, cancel, progress, &mut fixed_cache).map(|d| vec![d]);
+        }
+        let outputs = workflow::active_outputs(rules, &files);
+        let mut datasets = Vec::new();
+        let result = (|| {
+            for (index, output) in outputs.iter().enumerate() {
+                let leaf = workflow::execution(rules, &files, Some(output));
+                let mut dataset = self.process_cached(&leaf, false, cancel, |percent, message| {
+                    progress(((index * 100 + percent as usize) / outputs.len()) as u8,
+                        &format!("{}：{message}", output.name));
+                }, &mut fixed_cache)?;
+                dataset.name = output.name.trim().into();
+                dataset.group_id = Some(output.id.clone());
+                datasets.push(dataset);
+            }
+            if cancel.load(Ordering::SeqCst) {
+                return Err(AppError::new("CANCELLED", "任务已取消"));
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let conn = self.conn()?;
+            for dataset in &datasets {
+                conn.execute_batch(&format!("DROP TABLE IF EXISTS d_{}", dataset.id))?;
+                conn.execute("DELETE FROM issues WHERE dataset_id=?", params![dataset.id])?;
+            }
+            return Err(error);
+        }
+        Ok(datasets)
+    }
     pub fn validate(&self, rules: &RuleSet) -> Result<()> {
         self.guard()?;
-        self.validate_internal(rules)
+        let files = self.workspace.lock().unwrap().files.clone();
+        self.validate_internal(&workflow::normalize(rules.clone(), &files))
     }
     fn validate_internal(&self, rules: &RuleSet) -> Result<()> {
+        if workflow::mode(rules) == "single" && (!rules.file_selections.is_empty() || !rules.output_sheets.is_empty()) {
+            let files = self.workspace.lock().unwrap().files.clone();
+            return self.validate_internal(&workflow::execution(rules, &files, None));
+        }
         if rules.version != 2 {
             return Err(AppError::new("VERSION", "请先导入并转换旧版配置"));
+        }
+        if !["single", "bySheet", "legacy"].contains(&workflow::mode(rules)) {
+            return Err(AppError::new("MODE", "不支持的汇总模式"));
+        }
+        if workflow::mode(rules) != "single" {
+            let files = self.workspace.lock().unwrap().files.clone();
+            let outputs = workflow::active_outputs(rules, &files);
+            if outputs.is_empty() { return Err(AppError::new("SOURCES", "请启用文件并勾选至少一个工作表")); }
+            if outputs.len() > 32 {
+                return Err(AppError::new("SHEETS", "一次最多汇总 32 张结果表，请分批处理"));
+            }
+            let mut names = HashSet::new();
+            let mut ids = HashSet::new();
+            let mut source_names = HashSet::new();
+            for output in outputs {
+                if workflow::mode(rules) == "bySheet" && output.source_sheet_name.as_ref().is_none_or(|name| !source_names.insert(name)) {
+                    return Err(AppError::new("SHEETS", "汇总分组缺少原始 Sheet 名称或重复，请重新设置工作表选择"));
+                }
+                let name = output.name.trim();
+                if name.is_empty() || name.chars().count() > 31 || name.contains(['[', ']', ':', '*', '?', '/', '\\'])
+                    || name.starts_with('\'') || name.ends_with('\'') || name.chars().any(char::is_control) {
+                    return Err(AppError::new("SHEETS", "结果表名称需为 1～31 个字符，不能包含 []:*?/\\ 或以单引号开头、结尾"));
+                }
+                if !names.insert(name.to_lowercase()) || !ids.insert(&output.id) {
+                    return Err(AppError::new("SHEETS", "结果表名称或标识重复，请调整"));
+                }
+                if name.eq_ignore_ascii_case("history") {
+                    return Err(AppError::new("SHEETS", "History 是 Excel 保留表名，请换一个名称"));
+                }
+                if !output.rules.output_sheets.is_empty() {
+                    return Err(AppError::new("SHEETS", "结果表中不能再嵌套多表配置"));
+                }
+                self.validate_internal(&workflow::execution(rules, &files, Some(output))).map_err(|e| AppError::new(&e.code, format!("{name}：{}", e.message)))?;
+            }
+            return Ok(());
         }
         if !rules.sources.iter().any(|s| s.enabled) {
             return Err(AppError::new("SOURCES", "请勾选至少一个工作表"));
@@ -969,7 +1040,7 @@ SPU-201,精品挂耳咖啡包,咖啡周边,220,68,14960,2
             return Err(AppError::new("RULE", "不支持的合并方式"));
         }
         for mapping in &rules.mappings {
-            if mapping.target_key == "__source" || mapping.target_key.starts_with("fixed:") {
+            if mapping.target_key == "__source" || mapping.target_key.starts_with("fixed:") || mapping.target_key.starts_with("lookup:") {
                 return Err(AppError::new(
                     "MAPPING",
                     "来源和固定值列不能作为业务列映射目标",
@@ -993,6 +1064,15 @@ SPU-201,精品挂耳咖啡包,咖啡周边,220,68,14960,2
             reader::parse_address(&rule.address)?;
             if rule.name.trim().is_empty() {
                 return Err(AppError::new("CELL", "固定单元格列需要名称"));
+            }
+        }
+        let mut lookup_ids = HashSet::new();
+        for rule in &rules.lookup_columns {
+            if rule.id.trim().is_empty() || rule.name.trim().is_empty() || rule.sheet_name.trim().is_empty() || rule.header_row == 0
+                || rule.match_key.is_empty() || rule.lookup_key.is_empty() || rule.value_key.is_empty()
+                || !lookup_ids.insert(&rule.id) || !["error", "first", "last"].contains(&rule.duplicate_strategy.as_str())
+                || !["blank", "error"].contains(&rule.missing_strategy.as_str()) {
+                return Err(AppError::new("LOOKUP", "请完整配置补充列、关联字段和匹配处理方式"));
             }
         }
         for source in rules.sources.iter().filter(|s| s.enabled) {
@@ -1039,6 +1119,47 @@ SPU-201,精品挂耳咖啡包,咖啡周边,220,68,14960,2
             .cloned()
             .ok_or_else(|| AppError::new("NOT_FOUND", "处理结果不存在或已删除"))
     }
+    fn lookup_indices<'a>(&self, conn: &Connection, rules: &'a RuleSet, sheet: &SourceSheet,
+        raw_columns: &[Column], files: &'a [SourceFile], cancel: &AtomicBool, started: Instant) -> Result<Vec<LookupIndex<'a>>> {
+        // ponytail: 补充列按关联值建立内存索引；超大参考表再改用 DuckDB JOIN。
+        let mut indices = Vec::new();
+        for rule in &rules.lookup_columns {
+            let source_column = raw_columns.iter().position(|c| reader::same_key(&map_key(rules, &c.key), &rule.match_key))
+                .ok_or_else(|| AppError::new("LOOKUP", format!("{} 缺少关联字段 {}", sheet.name, reader::field_label(&rule.match_key))))?;
+            let file = files.iter().find(|f| f.id == sheet.file_id)
+                .ok_or_else(|| AppError::new("LOOKUP", "关联文件已移除，请重新选择来源表"))?;
+            let reference = file.sheets.iter().find(|s| s.name == rule.sheet_name)
+                .ok_or_else(|| AppError::new("LOOKUP", format!("{} 缺少补充信息表 {}", file.name, rule.sheet_name)))?;
+            let columns = self.columns_at(reference, rule.header_row)?;
+            let find = |key: &str| columns.iter().position(|c| reader::same_key(&c.key, key))
+                .ok_or_else(|| AppError::new("LOOKUP", format!("{} / {} 缺少字段 {}，请检查补充表的表头行", file.name, reference.name, reader::field_label(key))));
+            let key_column = find(&rule.lookup_key)?;
+            let value_column = find(&rule.value_key)?;
+            let padded = if columns[key_column].suggested_type == ColumnType::Text || columns[value_column].suggested_type == ColumnType::Text {
+                self.padded_for_sheet(reference)
+            } else { HashMap::new() };
+            let mut statement = conn.prepare(&format!("SELECT _row,c{key_column},t{key_column},c{value_column},t{value_column} FROM r_{} WHERE _row>? ORDER BY _row", reference.id))?;
+            let mut cursor = statement.query(params![rule.header_row as i64])?;
+            let mut values = HashMap::new();
+            while let Some(row) = cursor.next()? {
+                let number = row.get::<_, i64>(0)? as usize;
+                if number % 256 == 0 { check_cancel(cancel, started)?; }
+                let key = padded_identifier(&cell_from_row(row, 1)?, padded.get(&(number, key_column + 1)).copied()).text().trim().to_string();
+                if key.is_empty() { continue; }
+                if values.contains_key(&key) {
+                    match rule.duplicate_strategy.as_str() {
+                        "error" => return Err(AppError::new("LOOKUP_DUPLICATE", format!("{} / {} 的关联值「{}」重复，无法确定补充信息；请调整重复匹配处理方式", file.name, reference.name, key))),
+                        "first" => continue,
+                        _ => {}
+                    }
+                }
+                let value = padded_identifier(&cell_from_row(row, 3)?, padded.get(&(number, value_column + 1)).copied());
+                values.insert(key, (value, number));
+            }
+            indices.push(LookupIndex { rule, source_column, sheet: reference, value_column, values });
+        }
+        Ok(indices)
+    }
     pub fn process(
         &self,
         rules: &RuleSet,
@@ -1046,7 +1167,16 @@ SPU-201,精品挂耳咖啡包,咖啡周边,220,68,14960,2
         cancel: &AtomicBool,
         progress: impl Fn(u8, &str),
     ) -> Result<Dataset> {
+        let files = self.workspace.lock().unwrap().files.clone();
+        if workflow::mode(rules) != "single" { return Err(AppError::new("SHEETS", "请先选择要预览的汇总表")); }
+        let rules = workflow::execution(rules, &files, None);
+        self.process_cached(&rules, sample, cancel, progress, &mut FixedCache::new())
+    }
+    fn process_cached(&self, rules: &RuleSet, sample: bool, cancel: &AtomicBool, progress: impl Fn(u8, &str), fixed_cache: &mut FixedCache) -> Result<Dataset> {
         self.validate_internal(rules)?;
+        if !rules.output_sheets.is_empty() {
+            return Err(AppError::new("SHEETS", "请选择一张结果表检查规则"));
+        }
         let started = Instant::now();
         let dataset_id = id();
         let table = format!("d_{dataset_id}");
@@ -1068,6 +1198,7 @@ SPU-201,精品挂耳咖啡包,咖啡周边,220,68,14960,2
             }
             columns.retain(|c| {
                 c.key.starts_with("fixed:")
+                    || c.key.starts_with("lookup:")
                     || c.key == "__source"
                     || common.as_ref().is_some_and(|keys| keys.contains(&c.key))
             });
@@ -1127,10 +1258,12 @@ SPU-201,精品挂耳咖啡包,咖啡周边,220,68,14960,2
             let mut issue_writer = conn.appender("issues")?;
             let mut summary = Summary::default();
             let mut sequence = 0usize;
+            let mut fixed_warnings = HashSet::new();
             for (source_index, source) in sources.iter().enumerate() {
                 check_cancel(cancel, started)?;
                 let sheet = self.lookup_sheet(&source.sheet_id)?;
                 let raw_columns = self.columns_for_source(&sheet, source)?;
+                progress((10 + 75 * source_index / sources.len()) as u8, &format!("正在读取 {} 及补充信息", sheet.name));
                 let padded=if raw_columns.iter().any(|c|c.suggested_type==ColumnType::Text){self.padded_for_sheet(&sheet)}else{HashMap::new()};
                 let names = raw_columns
                     .iter()
@@ -1145,53 +1278,33 @@ SPU-201,精品挂耳咖啡包,咖啡周边,220,68,14960,2
                 let mut fixed = HashMap::new();
                 for rule in &rules.fixed_cells {
                     let key = format!("fixed:{}", rule.id);
-                    let fixed_sheet = files
-                        .iter()
-                        .find(|f| f.id == sheet.file_id)
-                        .and_then(|f| f.sheets.iter().find(|s| s.name == rule.sheet_name));
-                    let value = if let Some(fixed_sheet) = fixed_sheet {
+                    if !columns.iter().any(|c| c.key == key) || (!rule.target_sheets.is_empty() && !rule.target_sheets.contains(&sheet.name)) { continue; }
+                    let cache_key = (sheet.file_id.clone(), rule.sheet_name.clone(), rule.address.clone());
+                    if !fixed_cache.contains_key(&cache_key) {
                         let (r, c) = reader::parse_address(&rule.address)?;
-                        if c > fixed_sheet.width {
-                            Cell::Empty
-                        } else {
-                            read_rows(
-                                &conn,
-                                &format!("r_{}", fixed_sheet.id),
-                                fixed_sheet.width,
-                                r - 1,
-                                1,
-                            )?
-                            .first()
-                            .and_then(|(_, v)| v.get(c - 1))
-                            .cloned()
-                            .unwrap_or(Cell::Empty)
+                        let reference = files.iter().find(|f| f.id == sheet.file_id).and_then(|f| f.sheets.iter().find(|s| s.name == rule.sheet_name));
+                        let mut value = if let Some(reference) = reference.filter(|s| r <= s.rows && c <= s.width) {
+                            read_rows(&conn, &format!("r_{}", reference.id), reference.width, r - 1, 1)?.first()
+                                .and_then(|(_, row)| row.get(c - 1)).cloned().unwrap_or(Cell::Empty)
+                        } else { Cell::Empty };
+                        let missing = if reference.is_none() { Some(format!("缺少信息工作表 {}，{}!{} 已留空", rule.sheet_name, rule.sheet_name, rule.address)) }
+                            else if value.text().trim().is_empty() { Some(format!("{}!{} 没有有效内容，补充信息已留空", rule.sheet_name, rule.address)) } else { None };
+                        if missing.is_some() { value = Cell::Empty; }
+                        fixed_cache.insert(cache_key.clone(), (value, reference.map(|s| s.id.clone()).unwrap_or_else(|| sheet.id.clone()),
+                            r, c, rule.sheet_name.clone(), missing));
+                    }
+                    let value = fixed_cache[&cache_key].clone();
+                    if let Some(message) = &value.5 {
+                        if fixed_warnings.insert((sheet.file_id.clone(), rule.id.clone())) {
+                            summary.issue_count += 1;
+                            let file_name = files.iter().find(|f| f.id == sheet.file_id).map(|f| f.name.as_str()).unwrap_or("");
+                            issue_writer.append_row(params![dataset_id, sheet.file_id, value.1, value.2 as i64, rule.name, "", message,
+                                value.3 as i64, file_name, rule.sheet_name])?;
                         }
-                    } else {
-                        return Err(AppError::new(
-                            "MISSING_SHEET",
-                            format!(
-                                "文件 {} 缺少固定值工作表 {}",
-                                files
-                                    .iter()
-                                    .find(|f| f.id == sheet.file_id)
-                                    .map(|f| f.name.as_str())
-                                    .unwrap_or(""),
-                                rule.sheet_name
-                            ),
-                        ));
-                    };
-                    let (fixed_row, fixed_col) = reader::parse_address(&rule.address)?;
-                    fixed.insert(
-                        key,
-                        (
-                            value,
-                            fixed_sheet.unwrap().id.clone(),
-                            fixed_row,
-                            fixed_col,
-                            rule.sheet_name.clone(),
-                        ),
-                    );
+                    }
+                    fixed.insert(key, value);
                 }
+                let lookups = self.lookup_indices(&conn, rules, &sheet, &raw_columns, &files, cancel, started)?;
                 let sql = format!(
                     "SELECT * FROM r_{} WHERE _row>? ORDER BY _row {}",
                     sheet.id,
@@ -1226,10 +1339,27 @@ SPU-201,精品挂耳咖啡包,咖啡周边,220,68,14960,2
                     }
                     let mut cells = Vec::new();
                     let mut numbers = Vec::new();
+                    let mut extra = fixed.clone();
+                    let mut lookup_errors = HashMap::new();
+                    for lookup in &lookups {
+                        let source_column = lookup.source_column + source.header_range.as_ref().map(|r| r.start_column).unwrap_or(1);
+                        let key = padded_identifier(&raw[lookup.source_column], padded.get(&(source_row, source_column)).copied()).text().trim().to_string();
+                        let output_key = format!("lookup:{}", lookup.rule.id);
+                        if let Some((value, row)) = lookup.values.get(&key) {
+                            extra.insert(output_key, (value.clone(), lookup.sheet.id.clone(), *row, lookup.value_column + 1, lookup.sheet.name.clone(), None));
+                        } else {
+                            let message = format!("关联值「{key}」在 {} 中未匹配到，补充列已留空", lookup.sheet.name);
+                            if lookup.rule.missing_strategy == "error" {
+                                return Err(AppError::new("LOOKUP_MISSING", format!("{} 第 {source_row} 行：{message}", sheet.name)));
+                            }
+                            lookup_errors.insert(output_key.clone(), message);
+                            extra.insert(output_key, (Cell::Empty, sheet.id.clone(), source_row, source_column, sheet.name.clone(), None));
+                        }
+                    }
                     for column in &columns {
                         let mut raw_cell = if column.key == "__source" {
                             Cell::Text(source.source_name.clone())
-                        } else if let Some(value) = fixed.get(&column.key) {
+                        } else if let Some(value) = extra.get(&column.key) {
                             value.0.clone()
                         } else {
                             names
@@ -1248,7 +1378,7 @@ SPU-201,精品挂耳咖啡包,咖啡周边,220,68,14960,2
                             }
                         }
                         let mut cell = raw_cell.clone();
-                        let mut error = None;
+                        let mut error = lookup_errors.get(&column.key).cloned();
                         if matches!(&raw_cell,Cell::Text(s) if s=="#公式无缓存"||s.starts_with("#Excel错误:"))
                         {
                             error = Some(
@@ -1290,7 +1420,7 @@ SPU-201,精品挂耳咖啡包,咖啡周边,220,68,14960,2
                         if let Some(message) = error {
                             summary.issue_count += 1;
                             let (issue_sheet, issue_row, issue_col, issue_sheet_name) =
-                                if let Some(value) = fixed.get(&column.key) {
+                                if let Some(value) = extra.get(&column.key) {
                                     (value.1.clone(), value.2, value.3, value.4.clone())
                                 } else {
                                     (
@@ -1393,6 +1523,7 @@ SPU-201,精品挂耳咖啡包,咖啡周边,220,68,14960,2
             conn.execute_batch("COMMIT")?;
             Ok(Dataset {
                 id: dataset_id.clone(),
+                group_id: None,
                 name: format!(
                     "{} {}",
                     if sample {
@@ -1457,11 +1588,9 @@ SPU-201,精品挂耳咖啡包,咖啡周边,220,68,14960,2
                 matches!(
                     t.state,
                     TaskState::Pending | TaskState::Running | TaskState::Cancelling
-                ) && t
-                    .rules
-                    .sources
-                    .iter()
-                    .any(|s| s.enabled && sheets.contains(&s.sheet_id))
+                ) && if workflow::mode(&t.rules) == "legacy" {
+                    t.rules.output_sheets.iter().any(|o| o.rules.sources.iter().any(|s| s.enabled && sheets.contains(&s.sheet_id)))
+                } else { workflow::execution(&t.rules, &ws.files, None).sources.iter().any(|s| s.enabled && sheets.contains(&s.sheet_id)) }
             }) {
                 return Err(AppError::new(
                     "TASK_CONFLICT",
@@ -1478,9 +1607,11 @@ SPU-201,精品挂耳咖啡包,咖啡周边,220,68,14960,2
                     paths.extend(ds.exports.iter().map(PathBuf::from));
                 }
                 ws.datasets.retain(|d| !ids.contains(&d.id));
+                paths.retain(|path| !ws.datasets.iter().flat_map(|d| &d.exports).any(|p| PathBuf::from(p) == *path));
                 for task in &mut ws.tasks {
+                    task.dataset_ids.retain(|id| !ids.contains(id));
                     if task.dataset_id.as_ref().is_some_and(|id| ids.contains(id)) {
-                        task.dataset_id = None;
+                        task.dataset_id = task.dataset_ids.first().cloned();
                     }
                 }
             } else if kind == "files" {
@@ -1498,6 +1629,11 @@ SPU-201,精品挂耳咖啡包,咖啡周边,220,68,14960,2
                     .map(|s| s.id.clone())
                     .collect::<HashSet<_>>();
                 ws.rules.sources.retain(|s| valid.contains(&s.sheet_id));
+                let valid_files = ws.files.iter().map(|f| f.id.clone()).collect::<HashSet<_>>();
+                ws.rules.file_selections.retain(|f| valid_files.contains(&f.file_id));
+                for output in &mut ws.rules.output_sheets {
+                    output.rules.sources.retain(|s| valid.contains(&s.sheet_id));
+                }
                 if ws
                     .active_sheet_id
                     .as_ref()
@@ -1675,6 +1811,54 @@ fn map_key(rules: &RuleSet, key: &str) -> String {
         .find(|m| reader::same_key(&m.source_key, key))
         .map(|m| reader::canonical_key(&m.target_key))
         .unwrap_or_else(|| key.into())
+}
+fn sheet_presets(files: &[SourceFile], rules: &RuleSet) -> Vec<SheetPreset> {
+    rules.sources.iter().filter_map(|source| {
+        let file = files.iter().find(|f| f.sheets.iter().any(|s| s.id == source.sheet_id))?;
+        let sheet = file.sheets.iter().find(|s| s.id == source.sheet_id)?;
+        Some(SheetPreset {
+            name: sheet.name.clone(), header_row: source.header_row, enabled: source.enabled,
+            workbook_sheets: file.sheets.iter().map(|s| s.name.clone()).collect(), header_range: source.header_range.clone(),
+            file_name: Some(file.name.clone()), file_enabled: Some(workflow::file_enabled(rules, &file.id)), source_name: Some(source.source_name.clone()),
+            file_id: Some(file.id.clone()),
+        })
+    }).collect()
+}
+fn rules_from_presets(files: &[SourceFile], stored: &RuleSet, presets: &[SheetPreset], sources: &[SourceSelection], selected_files: &HashSet<String>) -> Result<RuleSet> {
+    let mut rules = stored.clone();
+    rules.sources = sources.to_vec();
+    rules.file_selections = files.iter().map(|f| FileSelection { file_id: f.id.clone(), enabled: selected_files.contains(&f.id) }).collect();
+    if presets.is_empty() { return Ok(rules); }
+    for source in &mut rules.sources {
+        let file = files.iter().find(|f| f.sheets.iter().any(|s| s.id == source.sheet_id))
+            .ok_or_else(|| AppError::new("SCHEME_MISMATCH", "方案中的来源表已移除，请重新导入文件"))?;
+        let sheet = file.sheets.iter().find(|s| s.id == source.sheet_id).unwrap();
+        let candidates = presets.iter().filter(|p| p.name == sheet.name).collect::<Vec<_>>();
+        let exact_id = candidates.iter().copied().find(|p| p.file_id.as_deref() == Some(file.id.as_str()));
+        let by_name = candidates.iter().copied().filter(|p| p.file_name.as_deref() == Some(file.name.as_str())).collect::<Vec<_>>();
+        let pool = if by_name.is_empty() { &candidates } else { &by_name };
+        if exact_id.is_none() && pool.windows(2).any(|pair| pair[0].header_row != pair[1].header_row || pair[0].header_range != pair[1].header_range || pair[0].enabled != pair[1].enabled
+            || pair[0].file_enabled.unwrap_or(true) != pair[1].file_enabled.unwrap_or(true) || (!by_name.is_empty() && pair[0].source_name != pair[1].source_name)) {
+            return Err(AppError::new("SCHEME_MISMATCH", format!("{} / {} 对应多套不同表头或勾选配置，请在首文件重新设置统一配置", file.name, sheet.name)));
+        }
+        let preset = exact_id.or_else(|| pool.iter().copied().find(|p| preset_matches(file, p))).or_else(|| pool.first().copied());
+        if let Some(preset) = preset {
+            source.enabled = preset.enabled;
+            source.header_row = preset.header_row;
+            source.header_range = preset.header_range.clone();
+            if let Some(name) = &preset.source_name {
+                let generated = preset.file_name.as_ref().is_some_and(|f| name == &format!("{} / {}", f, sheet.name) || name == &format!("{} - {}", Path::new(f).file_stem().unwrap_or_default().to_string_lossy(), sheet.name));
+                if !generated { source.source_name = name.clone(); }
+            }
+            if (preset.file_id.as_deref() == Some(file.id.as_str()) || preset.file_name.as_deref() == Some(file.name.as_str())) && preset.file_enabled == Some(false) {
+                if let Some(selection) = rules.file_selections.iter_mut().find(|f| f.file_id == file.id) { selection.enabled = false; }
+            }
+        } else { source.enabled = false; }
+    }
+    if !rules.sources.iter().any(|s| s.enabled && files.iter().any(|f| selected_files.contains(&f.id) && f.sheets.iter().any(|sheet| sheet.id == s.sheet_id))) {
+        return Err(AppError::new("SCHEME_MISMATCH", "所选文件没有与方案同名的来源工作表，请检查文件或选择其他方案"));
+    }
+    Ok(rules)
 }
 fn preset_matches(file: &SourceFile, preset: &SheetPreset) -> bool {
     preset.workbook_sheets.is_empty()

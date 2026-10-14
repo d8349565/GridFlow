@@ -92,6 +92,12 @@ pub struct SourceSelection {
     #[ts(optional)]
     pub header_range: Option<SheetRange>,
 }
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct FileSelection {
+    pub file_id: String,
+    pub enabled: bool,
+}
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SheetRange {
@@ -162,15 +168,48 @@ pub struct FixedCellRule {
     pub name: String,
     pub sheet_name: String,
     pub address: String,
+    #[serde(default)]
+    pub target_sheets: Vec<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct LookupRule {
+    pub id: String,
+    pub name: String,
+    pub sheet_name: String,
+    pub header_row: usize,
+    pub match_key: String,
+    pub lookup_key: String,
+    pub value_key: String,
+    pub duplicate_strategy: String,
+    pub missing_strategy: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct OutputSheet {
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub source_sheet_name: Option<String>,
+    pub rules: RuleSet,
+    #[serde(default)]
+    pub sheets: Vec<SheetPreset>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct RuleSet {
     pub version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub merge_mode: Option<String>,
+    pub file_selections: Vec<FileSelection>,
     pub sources: Vec<SourceSelection>,
     pub columns: Vec<ColumnRule>,
     pub mappings: Vec<ColumnMapping>,
     pub fixed_cells: Vec<FixedCellRule>,
+    pub lookup_columns: Vec<LookupRule>,
+    pub output_sheets: Vec<OutputSheet>,
     pub merge_strategy: String,
     pub remove_empty_rows: bool,
     pub remove_duplicates: bool,
@@ -186,10 +225,14 @@ impl Default for RuleSet {
     fn default() -> Self {
         Self {
             version: 2,
+            merge_mode: None,
+            file_selections: vec![],
             sources: vec![],
             columns: vec![],
             mappings: vec![],
             fixed_cells: vec![],
+            lookup_columns: vec![],
+            output_sheets: vec![],
             merge_strategy: "outer".into(),
             remove_empty_rows: false,
             remove_duplicates: false,
@@ -255,6 +298,9 @@ pub struct Summary {
 #[serde(rename_all = "camelCase")]
 pub struct Dataset {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub group_id: Option<String>,
     pub name: String,
     pub created_at: String,
     pub columns: Vec<Column>,
@@ -285,9 +331,11 @@ pub struct Task {
     pub finished_at: Option<String>,
     pub error: Option<String>,
     pub dataset_id: Option<String>,
+    #[serde(default)]
+    pub dataset_ids: Vec<String>,
     pub rules: RuleSet,
 }
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct SheetPreset {
     pub name: String,
@@ -295,6 +343,18 @@ pub struct SheetPreset {
     pub enabled: bool,
     #[serde(default)]
     pub workbook_sheets: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub file_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub file_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub file_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub source_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub header_range: Option<SheetRange>,
@@ -446,6 +506,7 @@ pub fn generate_types(path: &std::path::Path) -> std::io::Result<()> {
         SourceSheet,
         SourceFile,
         SourceSelection,
+        FileSelection,
         SheetRange,
         CellStyle,
         CellAppearance,
@@ -453,6 +514,8 @@ pub fn generate_types(path: &std::path::Path) -> std::io::Result<()> {
         ColumnRule,
         ColumnMapping,
         FixedCellRule,
+        LookupRule,
+        OutputSheet,
         RuleSet,
         Issue,
         ConversionExample,

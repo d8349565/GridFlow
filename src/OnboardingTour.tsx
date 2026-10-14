@@ -12,26 +12,26 @@ export interface TourStep {
 export const TOUR_STEPS: TourStep[] = [
   {
     selector: '[data-tour="file-sidebar"]',
-    title: "多表集中管理",
-    description: "左侧列出了所有待汇总的表格。已自动识别各工作表，点击任意表格可在右侧高保真预览原貌；日常也可随时点击「添加文件」导入更多表格。",
+    title: "按文件配置工作表",
+    description: "展开文件，勾选需要汇总的 Sheet，直接填写表头行和来源名称。只需设置首个参与汇总的文件，其余文件的同名表会自动跟随，无需复制。文件开关会保留 Sheet 选择。",
     placement: "right",
   },
   {
     selector: '[data-tour="set-header-btn"]',
-    title: "框选并设定表头",
-    description: "在中间表格预览区中，按住鼠标左键划选包含列名的整行（例如示例中的第 2 行），然后点击「设为表头」。系统会自动抽取列名并多表智能对齐。",
+    title: "确认列名所在行",
+    description: "单行表头可直接在左侧填写行号，也可采用识别建议。多行表头在原表中框选后点“设为表头”，再应用到其他同名表。",
     placement: "bottom",
   },
   {
     selector: '[data-tour="add-column-btn"]',
-    title: "孤立信息一键平铺",
-    description: "若报表顶部有独立的“门店名称”或“统计周期”单据属性（如示例中的 A1 格），单选该格并点击「添加为新列」，即可自动转为整张母表的新维度！",
+    title: "固定信息补充为新列",
+    description: "在“新增列”直接填写 Sheet、单元格地址和列名，也可在原表点选一个单元格。每份文件各取自己的值，默认补到所有汇总表中。",
     placement: "bottom",
   },
   {
     selector: '[data-tour="preview-btn"]',
-    title: "毫秒级合并与导出",
-    description: "配置完成后，点击右上角醒目的「预览结果」（或快捷键 Ctrl+Enter）。引擎将在本地毫秒级生成规范对齐的母表，随后即可自由筛选、分类汇总并导出！",
+    title: "生成并保存全部汇总表",
+    description: "配置完成后，点击右上角「生成汇总结果」（或 Ctrl+Enter）。处理完成后可查看完整结果、筛选数据，并保存到电脑。",
     placement: "bottom-left",
   },
 ];

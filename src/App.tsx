@@ -61,6 +61,11 @@ import { Button, Modal, Grid, StaticGrid } from "./components";
 import { formatChanges, formatPurpose } from "./review";
 import ExcelPreview, { rangeLabel } from "./ExcelPreview";
 import SourceFileList from "./SourceFileList";
+import LookupColumns from "./LookupColumns";
+import OutputManager from "./OutputManager";
+import ConfigCheck from "./ConfigCheck";
+import FixedInfoColumns from "./FixedInfoColumns";
+import { activeOutputs, editConfiguration, executionRules, fileEnabled, mergeMode, removeOutputColumn, syncGroups, syncOutputSources, outputError, templateFile, templateProblems } from "./summary";
 import OnboardingTour from "./OnboardingTour";
 import HelpModal from "./HelpModal";
 import {
@@ -79,6 +84,7 @@ import type {
   Workspace,
   RuleSet,
   SourceSheet,
+  SourceFile,
   Column,
   ColumnRule,
   Dataset,
@@ -112,8 +118,12 @@ const taskNames = {
   failed: "失败",
   interrupted: "已中断",
 };
-function ruleSignature(rules: RuleSet) {
-  return JSON.stringify(rules,(_,value) => value && typeof value === "object" && !Array.isArray(value)
+function ruleSignature(rules: RuleSet, files: SourceFile[]) {
+  const sources = rules.sources.filter((s) => s.enabled);
+  const names = sources.map((s) => files.flatMap((f) => f.sheets).find((sheet) => sheet.id === s.sheetId)?.name);
+  const effective = { ...rules, mergeMode: undefined, fileSelections: [], outputSheets: [], sources,
+    fixedCells: rules.fixedCells.map((r) => ({ ...r, targetSheets: names.length && names.every((name) => !!name && r.targetSheets.includes(name)) ? [] : r.targetSheets })) };
+  return JSON.stringify(effective,(_,value) => value && typeof value === "object" && !Array.isArray(value)
     ? Object.fromEntries(Object.keys(value).sort().map((key) => [key,value[key]])) : value);
 }
 type Edit = (rules: RuleSet) => RuleSet;
@@ -158,8 +168,19 @@ export default function App() {
     past: [],
     future: [],
   });
-  const rules = rulesState.current;
+  const allRules = rulesState.current;
+  const [activeOutputId, setActiveOutputId] = useState("");
   const [activeSheet, setActiveSheet] = useState<string | null>(null);
+  const files = ws?.files ?? [];
+  const mode = mergeMode(allRules);
+  const outputs = activeOutputs(allRules, files);
+  const firstFile = templateFile(allRules, files);
+  const pointedName = files.flatMap((f) => f.sheets).find((s) => s.id === activeSheet)?.name;
+  const activeOutput = outputs.find((o) => o.id === activeOutputId) ?? outputs.find((o) => o.sourceSheetName === pointedName) ?? outputs[0];
+  const rules = useMemo(() => executionRules(allRules, files, activeOutput), [allRules, ws?.files, activeOutput]);
+  const outputProblem = outputError(allRules, files);
+  const effectiveSources = executionRules(allRules, files).sources;
+  const hasSources = mode === "legacy" ? outputs.some((o) => o.rules.sources.some((s) => s.enabled)) : effectiveSources.some((s) => s.enabled);
   const [tab, setTab] = useState<
     "source" | "preview" | "result" | "pivot" | "chart"
   >("source");
@@ -178,12 +199,17 @@ export default function App() {
     error: boolean;
   } | null>(null);
   const [modal, setModal] = useState<string | null>(null);
+  const [savedExport, setSavedExport] = useState<{
+    path: string;
+    message: string;
+    returnTo: string | null;
+  } | null>(null);
   const [fileSidebarWidth, setFileSidebarWidth] = useState<number>(() => {
     try {
       const saved = Number(localStorage.getItem("gridflow_file_sidebar_width"));
-      return saved >= 180 && saved <= 600 ? saved : 216;
+      return saved >= 180 && saved <= 600 ? Math.max(240, saved) : 320;
     } catch {
-      return 216;
+      return 320;
     }
   });
   const [isResizingSidebar, setIsResizingSidebar] = useState(false);
@@ -202,7 +228,7 @@ export default function App() {
 
       const onPointerMove = (ev: PointerEvent) => {
         const delta = ev.clientX - startX;
-        const nextWidth = Math.min(600, Math.max(180, Math.round(startWidth + delta)));
+        const nextWidth = Math.min(600, Math.max(240, Math.round(startWidth + delta)));
         setFileSidebarWidth(nextWidth);
       };
       const onPointerUp = (ev: PointerEvent) => {
@@ -264,6 +290,8 @@ export default function App() {
     customOrder: [],
   });
   const [importReport, setImportReport] = useState<ImportItem[]>([]);
+  const [folderPaths, setFolderPaths] = useState<string[]>([]);
+  const [checkedFolders, setCheckedFolders] = useState<string[]>([]);
   const [selectedResults, setSelectedResults] = useState<string[]>([]);
   const [schemeId, setSchemeId] = useState("");
   const [issues, setIssues] = useState<Issue[]>([]);
@@ -287,8 +315,8 @@ export default function App() {
   const [suggestHeaders, setSuggestHeaders] = useState(false);
   const ready = useRef(false);
   const gridRequest = useRef(0);
-  const latestRules = useRef(rules);
-  latestRules.current = rules;
+  const latestRules = useRef(allRules);
+  latestRules.current = allRules;
   const latestActive = useRef(activeSheet);
   latestActive.current = activeSheet;
   const latestLocked = useRef(ws?.locked);
@@ -323,31 +351,38 @@ export default function App() {
     };
   }, []);
   const edit = useCallback(
-    (edit: Edit) => dispatch({ kind: "edit", edit }),
-    [],
+    (change: Edit) => dispatch({ kind: "edit", edit: (root) => editConfiguration(root, ws?.files ?? [], activeOutput, change) }),
+    [activeOutput, ws?.files],
   );
+  const editRoot = useCallback((change: Edit) => dispatch({ kind: "edit", edit: (root) => syncGroups(change(root), ws?.files ?? []) }), [ws?.files]);
   const running = ws?.tasks.find((t) =>
     ["running", "pending", "cancelling"].includes(t.state),
   );
   const sheet = ws?.files
     .flatMap((f) => f.sheets)
     .find((s) => s.id === activeSheet);
-  const source = rules.sources.find((s) => s.sheetId === activeSheet);
+  const source = (mode === "legacy" ? rules : allRules).sources.find((s) => s.sheetId === activeSheet);
+  const currentResultTask = ws?.tasks.find((t) => t.id === requestedTaskId);
+  const currentResultIds = currentResultTask?.datasetIds.length ? currentResultTask.datasetIds : currentResultTask?.datasetId ? [currentResultTask.datasetId] : [];
   const dataset =
     tab === "preview"
       ? preview
-      : (ws?.datasets.find((d) => d.id === resultId) ?? (!running ? ws?.datasets[0] : undefined) ?? null);
-  const signature = useMemo(() => ruleSignature(rules),[rules]);
-  const staleResult = !!dataset && signature !== ruleSignature(dataset.rules);
+      : (ws?.datasets.find((d) => d.id === resultId && (!currentResultTask || currentResultIds.includes(d.id)))
+        ?? (currentResultTask ? ws?.datasets.find((d) => currentResultIds.includes(d.id)) : !running ? ws?.datasets[0] : undefined) ?? null);
+  const datasetOutput = mode === "single" ? undefined : allRules.outputSheets.find((o) => dataset?.groupId ? o.id === dataset.groupId : o.name.trim() === dataset?.name);
+  const datasetRules = datasetOutput ? executionRules(allRules, files, datasetOutput) : rules;
+  const signature = useMemo(() => ruleSignature(datasetRules, files),[datasetRules, ws?.files]);
+  const staleResult = !!dataset && signature !== ruleSignature(dataset.rules, files);
+  const resultTask = ws?.tasks.find((t) => t.datasetIds.includes(dataset?.id ?? "") || t.datasetId === dataset?.id);
+  const resultSetIds = (resultTask?.datasetIds.length ? resultTask.datasetIds : resultTask?.datasetId ? [resultTask.datasetId] : dataset && !dataset.sample ? [dataset.id] : []).filter((id) => ws?.datasets.some((d) => d.id === id));
+  const resultChoices = resultSetIds.flatMap((id) => ws?.datasets.find((d) => d.id === id) ? [ws.datasets.find((d) => d.id === id)!] : []);
   const currentHeader = source?.headerRange ?? { startRow: source?.headerRow ?? 1,endRow: source?.headerRow ?? 1,startColumn: 1,endColumn: sheet?.width ?? 1 };
   const selection = selections[activeSheet ?? ""] ?? null;
   const singleSelection = !!selection && selection.startRow===selection.endRow && selection.startColumn===selection.endColumn;
   const requestedTask=ws?.tasks.find((t) => t.id===requestedTaskId);
   const stoppedTask=requestedTask && ["failed","cancelled","interrupted"].includes(requestedTask.state) ? requestedTask : null;
   const selectedSheets = rules.sources.filter((s) => s.enabled).length;
-  const selectedFiles = ws?.files.filter((f) => f.sheets.some((s) =>
-    rules.sources.some((r) => r.sheetId === s.id && r.enabled),
-  )) ?? [];
+  const selectedFiles = files.filter((f) => fileEnabled(allRules, f.id));
   const isHome = homeView || (!ws?.files.length && phase === "configure");
   const selectedItems = selectedFiles.flatMap((f) => f.sheets.flatMap((s) => {
     const selection = rules.sources.find((r) => r.sheetId === s.id && r.enabled);
@@ -384,6 +419,10 @@ export default function App() {
     ...rules.columns.filter((r) => columns.some((c) => c.key === r.key)),
     ...mergedColumns.filter((c) => !rules.columns.some((r) => r.key === c.key)),
   ];
+  const keptColumns = allColumns.filter((c) => !c.hidden && c.dataType !== "skip");
+  const removedColumns = allColumns.filter((c) => c.hidden || c.dataType === "skip");
+  const selectedSheetNames = [...new Set(selectedItems.map((item) => item.sheet.name))];
+
 
   function error(error: unknown) {
     const message =
@@ -414,8 +453,10 @@ export default function App() {
     setWs(value);
     if (initial) {
       dispatch({ kind: "reset", rules: value.rules });
+      setActiveOutputId(value.rules.outputSheets.find((o) => o.rules.sources.some((s) => s.enabled && s.sheetId === value.activeSheetId))?.id ?? "");
       setActiveSheet(value.activeSheetId);
       setResultId(value.datasets[0]?.id ?? null);
+      setRequestedTaskId(value.tasks.find((t) => t.datasetIds.includes(value.datasets[0]?.id ?? "") || t.datasetId === value.datasets[0]?.id)?.id ?? null);
       setSchemeId(value.schemes.at(-1)?.id ?? "");
       ready.current = !value.locked;
       for (const t of value.tasks) {
@@ -431,13 +472,16 @@ export default function App() {
   }, []);
   useEffect(() => {
     if (!running && ws?.datasets.length) {
-      if (!resultId || !ws.datasets.some((d) => d.id === resultId)) {
-        const nextId = ws.datasets[0].id;
+      const scope = requestedTaskId ? ws.tasks.find((t) => t.id === requestedTaskId) : undefined;
+      const ids = scope?.datasetIds.length ? scope.datasetIds : scope?.datasetId ? [scope.datasetId] : [];
+      if (!resultId || !ws.datasets.some((d) => d.id === resultId && (!scope || ids.includes(d.id)))) {
+        const nextId = scope ? ws.datasets.find((d) => ids.includes(d.id))?.id : ws.datasets[0].id;
+        if (!nextId) return;
         setResultId(nextId);
         setQuery(queryFor(nextId));
       }
     }
-  }, [ws?.datasets, resultId, running]);
+  }, [ws?.datasets, ws?.tasks, requestedTaskId, resultId, running]);
   useEffect(() => {
     if (!notice || notice.error || modal) return;
     const timer = setTimeout(() => setNotice(null), 8000);
@@ -447,11 +491,11 @@ export default function App() {
     if (!ready.current || ws?.locked) return;
     const timer = setTimeout(
       () =>
-        call("save_draft", { rules, activeSheetId: activeSheet }).catch(error),
+        call("save_draft", { rules: allRules, activeSheetId: activeSheet }).catch(error),
       450,
     );
     return () => clearTimeout(timer);
-  }, [rules, activeSheet, ws?.locked]);
+  }, [allRules, activeSheet, ws?.locked]);
   useEffect(() => {
     if (!ws || ws.locked || !activeSheet) return;
     setRawPage(null);
@@ -468,9 +512,12 @@ export default function App() {
       .catch(error);
   }, [activeSheet, ws?.files.length, ws?.locked]);
   const sourceSignature = JSON.stringify([
+    activeOutput?.id,
     rules.sources,
     rules.mappings,
     rules.fixedCells,
+    rules.lookupColumns,
+    rules.includeSource,
   ]);
   useEffect(() => {
     if (!ready.current || ws?.locked || !selectedSheets) {
@@ -555,6 +602,7 @@ export default function App() {
             value.datasets.find((d) => d.id === newlyDone.datasetId) ??
             value.datasets[0];
           if (nextDataset) {
+            setRequestedTaskId(newlyDone.id);
             setResultId(nextDataset.id);
             setQuery(queryFor(nextDataset.id));
           }
@@ -562,7 +610,7 @@ export default function App() {
             setTab("result");
           }
           setNotice({
-            message: "汇总表已生成。点击「保存到电脑」就能拿到文件，也可以先筛选或做分类统计。",
+            message: newlyDone.datasetIds.length > 1 ? `已生成 ${newlyDone.datasetIds.length} 张汇总表，可切换查看，或保存为一个多 Sheet Excel。` : "汇总表已生成。点击「保存到电脑」就能拿到文件，也可以先筛选或做分类统计。",
             error: false,
           });
           setWs(value);
@@ -620,26 +668,25 @@ export default function App() {
     }
     document.addEventListener("keydown", key);
     return () => document.removeEventListener("keydown", key);
-  }, [rules, selectedSheets]);
+  }, [allRules, selectedSheets]);
   async function importChoose(directory = false, append = true) {
     const paths = await chooseFiles(directory);
+    if (directory && paths.length) {
+      setFolderPaths(paths); setCheckedFolders(paths); setModal("folders");
+      return;
+    }
     if (paths.length) await importPaths(paths, append);
   }
   async function importPaths(paths: string[], append = true) {
     await action("导入文件", async () => {
+      await call("save_draft", { rules: latestRules.current, activeSheetId: latestActive.current });
       const report = await call<ImportItem[]>("import_files", { paths });
       setImportReport(report);
       const value = await refresh();
       const added = new Set(
         report.flatMap((item) => item.file?.sheets.map((s) => s.id) ?? []),
       );
-      const next = {
-        ...value.rules,
-        sources: value.rules.sources.map((s) => ({
-          ...s,
-          enabled: added.has(s.sheetId) || (append && s.enabled),
-        })),
-      };
+      const next = syncOutputSources(latestRules.current, value.rules.sources, value.files, added, append);
       dispatch({ kind: "edit", edit: () => next });
       setActiveSheet([...added][0] ?? value.activeSheetId);
       setTab("source");
@@ -665,13 +712,7 @@ export default function App() {
       const added = new Set(
         report.flatMap((item) => item.file?.sheets.map((s) => s.id) ?? []),
       );
-      const next = {
-        ...value.rules,
-        sources: value.rules.sources.map((s) => ({
-          ...s,
-          enabled: added.has(s.sheetId),
-        })),
-      };
+      const next = syncOutputSources(defaultRules(), value.rules.sources, value.files, added, false);
       dispatch({ kind: "edit", edit: () => next });
       setActiveSheet([...added][0] ?? value.activeSheetId);
       setTab("source");
@@ -690,6 +731,10 @@ export default function App() {
     });
   }
   async function generate(nextRules = latestRules.current) {
+    const problem = templateProblems(nextRules, files)[0];
+    if (problem) { setNotice({ message: problem, error: true }); return; }
+    const invalid = phase === "configure" ? document.querySelector<HTMLInputElement>('.file-sidebar input:invalid') : null;
+    if (invalid) { invalid.focus(); setNotice({ message: "请先填写有效的来源表头行号。", error: true }); return; }
     await action("提交任务", async () => {
       const task = await call<Task>("submit_task", {
         rules: nextRules,
@@ -698,28 +743,31 @@ export default function App() {
       setPhase("results"); setTab("result"); setResultId(null);
       setWs((old) => (old ? { ...old, tasks: [task, ...old.tasks] } : old));
       setNotice({
-        message: "正在合并所选表格，完成后会显示总计表。你可以继续查看文件。",
+        message: nextRules.outputSheets.length ? `正在分别汇总 ${nextRules.outputSheets.length} 张结果表，完成后可统一导出。` : "正在合并所选表格，完成后会显示总计表。你可以继续查看文件。",
         error: false,
       });
     });
   }
-  async function previewRules() {
+  async function previewRules(checkOnly = phase === "configure") {
+    const problem = templateProblems(allRules, files)[0];
+    if (problem) { setNotice({ message: problem, error: true }); return; }
+    const invalid = document.querySelector<HTMLInputElement>('.file-sidebar input:invalid');
+    if (invalid) { invalid.focus(); setNotice({ message: "请先填写有效的来源表头行号。", error: true }); return; }
     await action("规则预览", async () => {
       const ds = await call<Dataset>("preview_rules", { rules });
       setPreview(ds);
-      setQuery(queryFor(ds.id));
-      setTab("preview");
-      setPhase("results");
+      if (checkOnly) { setModal("config-check"); return; }
+      setQuery(queryFor(ds.id)); setTab("preview"); setPhase("results");
     });
   }
   async function applyScheme() {
     if (!schemeId) return;
     const applied = await action("应用方案", async () => {
-      const next = await call<RuleSet>("apply_scheme", { schemeId, rules });
-      edit(() => next);
+      const next = await call<RuleSet>("apply_scheme", { schemeId, rules: allRules });
+      dispatch({ kind: "edit", edit: () => next });
       setPreview(null);
       setNotice({
-        message: "已使用保存的设置。点击「配置完成，预览结果」即可继续。",
+        message: "已使用保存的设置。点击右上角「生成汇总结果」即可继续。",
         error: false,
       });
       return true;
@@ -730,7 +778,7 @@ export default function App() {
     await action("保存方案", async () => {
       const scheme = await call<Scheme>("save_scheme", {
         name: saveName,
-        rules,
+        rules: allRules,
       });
       setSchemeId(scheme.id);
       setSaveName("");
@@ -766,15 +814,32 @@ export default function App() {
     });
   }
   function moveColumn(key: string, direction: number) {
-    const i = allColumns.findIndex((c) => c.key === key);
+    const i = keptColumns.findIndex((c) => c.key === key);
     const j = i + direction;
-    if (j < 0 || j >= allColumns.length) return;
+    if (i < 0 || j < 0 || j >= keptColumns.length) return;
     edit((r) => {
-      const next = [...allColumns];
+      const next = [...keptColumns];
       [next[i], next[j]] = [next[j], next[i]];
-      r.columns = next;
+      r.columns = [...next, ...removedColumns];
       return r;
     });
+  }
+  function removeColumn(col: ColumnRule) {
+    edit((r) => removeOutputColumn(r, allColumns, col.key));
+    setNotice({ message: `已移除「${col.name}」，生成的新结果不再包含这列。可用顶部“撤销”恢复。`, error: false });
+  }
+  function setHeaderRow(row: number, sameName = false) {
+    if (!sheet || !source || !Number.isInteger(row) || row < 1 || row > sheet.rows) return;
+    if (!sameName && row === source.headerRow && !source.headerRange) return;
+    const targets = sameName ? selectedItems.filter((item) => item.sheet.name === sheet.name) : selectedItems.filter((item) => item.sheet.id === sheet.id);
+    if (targets.some((item) => item.sheet.rows < row)) {
+      setSelectionError("部分同名表没有这一行，请单独设置。"); return;
+    }
+    const ids = new Set(targets.map((item) => item.sheet.id)); ids.add(sheet.id);
+    const change: Edit = (r) => ({ ...r, sources: r.sources.map((s) => ids.has(s.sheetId) ? { ...s, headerRow: row, headerRange: undefined } : s) });
+    if (mode === "legacy") edit(change); else editRoot(change);
+    setSelectionError("");
+    setNotice({ message: `已将 ${ids.size} 张表的第 ${row} 行设为列名，数据从第 ${row + 1} 行开始。`, error: false });
   }
   function selectArea(range: SheetRange,cell: Cell | null) {
     if (!activeSheet) return;
@@ -793,20 +858,22 @@ export default function App() {
   function applyHeader() {
     if (!headerCandidate || !sheet) return;
     const area=headerCandidate.range;
-    const targets=selectedItems.filter((item) => item.sheet.id===sheet.id || (headerScope && item.sheet.name===sheet.name));
+    const targets=selectedItems.filter((item) => item.sheet.id===sheet.id || ((mode !== "legacy" || headerScope) && item.sheet.name===sheet.name));
     const bad=targets.filter((item) => item.sheet.rows<area.endRow || item.sheet.width<area.endColumn);
     if (bad.length) { setSelectionError(`选区超出 ${bad[0].file.name} 的范围。可以取消批量应用，单独设置此表。`); return; }
     const ids=new Set(targets.map((item) => item.sheet.id)); ids.add(sheet.id);
-    edit((r) => ({ ...r,sources:r.sources.map((s) => ids.has(s.sheetId)?{ ...s,headerRow:area.endRow,headerRange:area }:s) }));
+    const change: Edit = (r) => ({ ...r,sources:r.sources.map((s) => ids.has(s.sheetId)?{ ...s,headerRow:area.endRow,headerRange:area }:s) });
+    if (mode === "legacy") edit(change); else editRoot(change);
     setModal(null);setSelectionError("");
     setNotice({ message:`已设置 ${targets.length || 1} 张表的表头 ${rangeLabel(area)}，从第 ${area.endRow+1} 行开始读取。`,error:false });
   }
   function addSelectedCell() {
+    if (mode === "legacy") { setNotice({ message: "旧自定义分组的规则已保留，请先保存旧方案并重新设置，再新增通用固定信息。", error: false }); return; }
     if (!singleSelection || !selection || !selectedCell || !sheet) return;
     setFixedCandidate({ row:selection.startRow,column:selection.startColumn,value:selectedCell,sheet });
     const left=rawPage?.rows[selection.startRow-1]?.[selection.startColumn-2];
     const label=cellText(left).replace(/[：:]\s*$/,"");
-    setSaveName(label && label.length<=20 && /名称|门店|机构|日期|部门|负责人|区域|编号/.test(label)?label:`附加信息 ${rules.fixedCells.length+1}`);
+    setSaveName(label && label.length<=20 && /名称|门店|机构|日期|部门|负责人|区域|编号/.test(label)?label:`附加信息 ${allRules.fixedCells.length+1}`);
     setModal("fixed");
   }
   function goHome() {
@@ -868,7 +935,7 @@ export default function App() {
           } as ColumnRule;
         }) : allColumns;
         const extras = allColumns.filter(
-          (c) => c.key === "__source" || c.key.startsWith("fixed:"),
+          (c) => c.key === "__source" || c.key.startsWith("fixed:") || c.key.startsWith("lookup:"),
         );
         r.columns = [...hinted, ...extras.filter((c) => !hinted.some((h) => h.key === c.key))]
           .map((c) => {
@@ -882,7 +949,16 @@ export default function App() {
       message: "已使用所选调整。可以查看合并预览，或直接合并全部数据。",
       error: false,
     });
-    if (merge) void generate(next);
+    if (merge) void generate(editConfiguration(allRules, files, activeOutput, () => next));
+  }
+  function showSavedExport(path: string, message: string) {
+    setNotice({ message, error: false });
+    setSavedExport({ path, message, returnTo: modal });
+    setModal("export-saved");
+  }
+  function closeSavedExport() {
+    setModal(savedExport?.returnTo ?? null);
+    setSavedExport(null);
   }
   async function exportCurrent(
     kind: "dataset" | "pivot" | "image" = "dataset",
@@ -900,9 +976,11 @@ export default function App() {
         const binary = atob(chartPng.current().split(",")[1]);
         await call("save_image", {
           path,
+          datasetId: dataset.id,
           bytes: Array.from(binary, (c) => c.charCodeAt(0)),
         });
-        setNotice({ message: `图表已保存：${path}`, error: false });
+        await refresh();
+        showSavedExport(path, "图表已保存。");
         return;
       }
       const filename = `${kind === "pivot" ? "分类统计" : "汇总表"}_${new Date().toLocaleDateString("sv-SE")}.${exportFormat}`;
@@ -925,7 +1003,7 @@ export default function App() {
           : { query: { ...query, datasetId: dataset.id }, path },
       );
       await refresh();
-      setNotice({ message: `已保存：${path}`, error: false });
+      showSavedExport(path, "表格已保存。");
     });
   }
   async function showIssues(ds: Dataset, offset = 0) {
@@ -987,7 +1065,7 @@ export default function App() {
   async function batchExport(zip = false) {
     await action("批量导出", async () => {
       if (!selectedResults.length) return;
-      const dirs = await chooseFiles(true);
+      const dirs = await chooseFiles(true, false, false);
       if (!dirs.length) return;
       const zipPath = zip
         ? await savePath("汇总结果合集.zip", "zip", dirs[0])
@@ -1000,10 +1078,38 @@ export default function App() {
         format: exportFormat,
       });
       await refresh();
-      setNotice({
-        message: `已保存 ${paths.length - (zip ? 1 : 0)} 个结果${zip ? "及 ZIP 合集" : ""}。`,
-        error: false,
+      const path = zipPath ?? paths[0];
+      if (path) showSavedExport(path, `已保存 ${paths.length - (zip ? 1 : 0)} 个结果${zip ? "及 ZIP 合集" : ""}。`);
+    });
+  }
+  async function exportWorkbook(ids: string[]) {
+    await action("导出多表 Excel", async () => {
+      const path = await savePath(`多表汇总_${new Date().toLocaleDateString("sv-SE")}.xlsx`, "xlsx", ws?.settings.lastExportDirectory);
+      if (!path) return;
+      await call("export_workbook", { queries: ids.map(queryFor), path });
+      await refresh();
+      showSavedExport(path, `已保存 ${ids.length} 张结果表到同一个 Excel。`);
+    });
+  }
+  function selectOutput(id: string) {
+    setActiveOutputId(id); setPreview(null); setColumns([]); setInputColumns([]);
+    setSelectedCell(null); setSelectionError("");
+    const output = allRules.outputSheets.find((o) => o.id === id);
+    setActiveSheet(output ? executionRules(allRules, files, output).sources.find((s) => s.enabled)?.sheetId ?? activeSheet : activeSheet);
+  }
+  function enableOutputs() {
+    editRoot((root) => ({ ...root, mergeMode: "bySheet" })); setActiveOutputId(""); setPreview(null);
+  }
+  async function restartSourceWorkflow() {
+    await action("保存旧配置", async () => {
+      await call("save_scheme", { name: `旧自定义分组_${new Date().toISOString()}`, rules: allRules });
+      const sources = files.flatMap((file) => {
+        const first = file.sheets.find((s) => s.rows && s.width);
+        return file.sheets.map((sheet) => ({ sheetId: sheet.id, enabled: sheet.id === first?.id, headerRow: 1, sourceName: `${file.name} / ${sheet.name}` }));
       });
+      editRoot(() => ({ ...defaultRules(), sources, fileSelections: allRules.fileSelections }));
+      setActiveOutputId(""); setPreview(null); await refresh();
+      setNotice({ message: "旧分组已另存为方案。现在可按文件勾选和配置 Sheet，原方案仍可复用。", error: false });
     });
   }
   function askDelete(kind: string, ids: string[]) {
@@ -1097,7 +1203,7 @@ export default function App() {
         </div>
         {!!(ws?.files.length || ws?.datasets.length) && <nav className="stage-nav" aria-label="汇总步骤">
           <button className={phase === "configure" && !isHome ? "active" : ""} aria-current={phase === "configure" && !isHome ? "step" : undefined} aria-label={phase === "results" ? "返回修改配置" : undefined} title="配置表头、输出列与整理方式" onClick={returnToConfig}><span aria-hidden="true">1</span>配置汇总内容</button>
-          <button className={phase === "results" && !isHome ? "active" : ""} aria-current={phase === "results" && !isHome ? "step" : undefined} disabled={!preview && !ws?.datasets.length && !running} onClick={() => { setHomeView(false); setPhase("results");setTab(preview ? "preview" : "result");if(preview)setQuery(queryFor(preview.id)); }}><span aria-hidden="true">2</span>预览与保存</button>
+          <button className={phase === "results" && !isHome ? "active" : ""} aria-current={phase === "results" && !isHome ? "step" : undefined} disabled={!ws?.datasets.length && !running} onClick={() => { setHomeView(false); setPhase("results");setTab("result"); }}><span aria-hidden="true">2</span>预览与保存</button>
         </nav>}
         <div className="header-actions">
           {phase === "configure" && !!ws?.files.length && !isHome && <>
@@ -1105,7 +1211,7 @@ export default function App() {
               <Button className="quiet icon-button" icon={Undo2} aria-label="撤销配置修改" title="撤销上一次调整" disabled={!rulesState.past.length} onClick={() => dispatch({ kind:"undo" })} />
               <Button className="quiet icon-button" icon={Redo2} aria-label="重做配置修改" title="恢复撤销的调整" disabled={!rulesState.future.length} onClick={() => dispatch({ kind:"redo" })} />
             </div>
-            <Button className="quiet" icon={Save} disabled={!selectedSheets} title="保存或套用汇总配置文件" onClick={() => setModal("reuse")}>配置文件</Button>
+            <Button className="quiet" icon={Save} disabled={!selectedFiles.length} title="保存或套用汇总配置文件" onClick={() => setModal("reuse")}>配置文件</Button>
           </>}
           <Button
             className={`quiet icon-button ${isHome ? "selected" : ""}`}
@@ -1121,11 +1227,11 @@ export default function App() {
           <Button className="quiet icon-button" icon={Settings} aria-label="设置" title="设置" onClick={() => {
             setModal("settings");void call<number>("disk_usage").then(setDisk).catch(error);
           }} />
-          {phase === "configure" && !!ws?.files.length && !isHome ? <Button data-tour="preview-btn" icon={Play} primary disabled={!selectedSheets || !!busy} loading={busy === "提交任务"} onClick={() => void generate()}>预览结果</Button>
+          {phase === "configure" && !!ws?.files.length && !isHome ? <Button data-tour="preview-btn" icon={Play} primary disabled={!hasSources || !!outputProblem || !!busy} title={outputProblem || undefined} loading={busy === "提交任务"} onClick={() => void generate()}>生成汇总结果</Button>
             : phase === "results" && !isHome && tab !== "pivot" && tab !== "chart" ? <>
-              {staleResult && <Button icon={RefreshCw} primary disabled={!!busy || !selectedSheets} onClick={() => void generate()}>按当前配置刷新结果</Button>}
+              {staleResult && <Button icon={RefreshCw} primary disabled={!!busy || !hasSources || !!outputProblem} onClick={() => void generate()}>按当前配置刷新结果</Button>}
               <select aria-label="导出格式" value={exportFormat} onChange={(e) => setExportFormat(e.target.value)}><option value="xlsx">Excel</option><option value="csv">CSV</option></select>
-              <Button icon={Download} primary={!staleResult} disabled={!dataset || !!busy} loading={busy === "导出"} onClick={() => void exportCurrent()}>{staleResult ? "保存此版本" : query.filters.length || query.search ? "保存筛选后的表格" : "保存到电脑"}</Button>
+              <Button icon={Download} primary={!staleResult} disabled={!dataset || !!busy} loading={busy === "导出" || busy === "导出多表 Excel"} onClick={() => void (tab !== "preview" && exportFormat === "xlsx" && resultSetIds.length > 1 && !query.filters.length && !query.search ? exportWorkbook(resultSetIds) : exportCurrent())}>{query.filters.length || query.search ? "保存筛选后的表格" : tab !== "preview" && exportFormat === "xlsx" && resultSetIds.length > 1 ? `保存全部 ${resultSetIds.length} 张表到 Excel` : staleResult ? "保存此版本" : "保存到电脑"}</Button>
             </> : null}
         </div>
       </header>
@@ -1135,20 +1241,22 @@ export default function App() {
         style={{ "--file-width": `${fileSidebarWidth}px` } as React.CSSProperties}
       >
         {phase === "configure" && !isHome && !!ws?.files.length && panels.files && <aside className="file-sidebar" data-tour="file-sidebar" tabIndex={0} onKeyDown={(e) => {
-          if (e.key === "Delete" && selectedFiles.length > 0 && !modal && !confirm) {
+          const editing = (e.target as HTMLElement).closest("input:not([type=checkbox]),textarea,select,[contenteditable=true]");
+          if (e.key === "Delete" && !editing && selectedFiles.length > 0 && !modal && !confirm) {
             askDelete("files", selectedFiles.map((f) => f.id));
           }
         }}>
           <div className="section-title">
             <label className="source-all">
-              <input type="checkbox" aria-label="全选工作表" title="全选或取消全部工作表"
-                checked={rules.sources.length > 0 && rules.sources.every((source) => source.enabled)}
-                ref={(input) => { if (input) input.indeterminate = selectedSheets > 0 && selectedSheets < rules.sources.length; }}
+              <input type="checkbox" aria-label="启用全部文件" title="启用或暂时排除全部文件；各 Sheet 勾选会保留"
+                checked={files.length > 0 && files.every((file) => fileEnabled(allRules, file.id))}
+                disabled={!!busy || mode === "legacy"}
+                ref={(input) => { if (input) input.indeterminate = selectedFiles.length > 0 && selectedFiles.length < files.length; }}
                 onChange={(event) => {
                   const enabled = event.target.checked;
-                  edit((r) => ({
+                  editRoot((r) => ({
                     ...r,
-                    sources: r.sources.map((s) => ({ ...s, enabled })),
+                    fileSelections: files.map((f) => ({ fileId: f.id, enabled })),
                   }));
               }} />
               <span>文件 <b>{ws?.files.length ?? 0}</b></span>
@@ -1171,15 +1279,23 @@ export default function App() {
             <details className="import-menu" onBlur={(e) => { if (!e.currentTarget.contains(e.relatedTarget as Node | null)) e.currentTarget.open = false; }} onKeyDown={(e) => { if (e.key === "Escape") { e.currentTarget.open = false;e.currentTarget.querySelector("summary")?.focus(); } }}>
               <summary aria-label="更多导入方式" title="添加文件夹或换一批文件"><ChevronDown size={15} /></summary>
               <div className="import-options">
-                <Button icon={FolderOpen} disabled={!!busy} onClick={(e) => { e.currentTarget.closest("details")!.open = false;void importChoose(true, true); }}>添加文件夹</Button>
+                <Button icon={FolderOpen} disabled={!!busy} onClick={(e) => { e.currentTarget.closest("details")!.open = false;void importChoose(true, true); }}>添加多个文件夹</Button>
                 <Button icon={RefreshCw} disabled={!!busy} title="更换本次文件，之前的文件和结果仍保留" onClick={(e) => { e.currentTarget.closest("details")!.open = false;void importChoose(false, false); }}>换一批文件</Button>
               </div>
             </details>
           </div>
-          <SourceFileList files={ws?.files ?? []} sources={rules.sources} activeSheet={activeSheet}
-            onSelect={(ids, enabled) => edit((r) => ({ ...r, sources: r.sources.map((source) => ids.includes(source.sheetId) ? { ...source, enabled } : source) }))}
-            onPreview={(sheetId) => { setActiveSheet(sheetId);setSelectedCell(null);setSelectionError("");setFocusRow(undefined);setPhase("configure");setTab("source");setHomeView(false); }}
-            onDelete={(fileId) => askDelete("files", [fileId])} />
+          <SourceFileList files={files} sources={mode === "legacy" ? rules.sources : allRules.sources} fileSelections={allRules.fileSelections} activeSheet={activeSheet} templateId={firstFile?.id} disabled={!!busy || mode === "legacy"}
+            onFileSelect={(fileId, enabled) => editRoot((root) => ({ ...root, fileSelections: files.map((f) => ({ fileId: f.id, enabled: f.id === fileId ? enabled : fileEnabled(root, f.id) })) }))}
+            onSourceChange={(sheetId, patch) => {
+              editRoot((root) => ({ ...root, sources: root.sources.map((s) => s.sheetId === sheetId ? { ...s, ...patch } : s) }));
+              if (patch.enabled) { setActiveSheet(sheetId); setActiveOutputId(""); }
+            }}
+            onPreview={(sheetId) => {
+              const name = files.flatMap((f) => f.sheets).find((s) => s.id === sheetId)?.name;
+              const output = outputs.find((o) => o.sourceSheetName === name);
+              if (output) setActiveOutputId(output.id);
+              setActiveSheet(sheetId);setSelectedCell(null);setSelectionError("");setFocusRow(undefined);setPhase("configure");setTab("source");setHomeView(false);
+            }} onDelete={(fileId) => askDelete("files", [fileId])} />
           <div
             className="sidebar-resizer"
             role="separator"
@@ -1188,9 +1304,9 @@ export default function App() {
             title="左右拖动调整列表宽度，双击恢复默认"
             onPointerDown={handleResizerPointerDown}
             onDoubleClick={() => {
-              setFileSidebarWidth(216);
+              setFileSidebarWidth(320);
               try {
-                localStorage.setItem("gridflow_file_sidebar_width", "216");
+                localStorage.setItem("gridflow_file_sidebar_width", "320");
               } catch {}
             }}
           />
@@ -1226,9 +1342,9 @@ export default function App() {
               </button>
             ))}
           </div><div className="result-tools">
-            {tab !== "preview" && <select aria-label={tab === "result" ? "选择汇总表" : "分析数据来源"} value={dataset?.id ?? resultId ?? ""} onChange={(e) => {
+            {tab !== "preview" && <select aria-label={tab === "result" ? "选择汇总表" : "分析数据来源"} disabled={!resultChoices.length} value={dataset?.id ?? ""} onChange={(e) => {
               setResultId(e.target.value);setQuery(queryFor(e.target.value));setAnalysis(null);
-            }}><option value="">选择汇总表</option>{ws?.datasets.map((d) => <option key={d.id} value={d.id}>{d.name}</option>)}</select>}
+            }}><option value="">选择汇总表</option>{resultChoices.map((d) => <option key={d.id} value={d.id}>{d.name}</option>)}</select>}
             {tab === "preview" ? <Button icon={RefreshCw} disabled={!selectedSheets || !!busy} loading={busy === "规则预览"} onClick={() => void previewRules()}>刷新预览</Button>
               : tab === "pivot" || tab === "chart" ? <>
                 <Button icon={RefreshCw} primary disabled={!dataset || !!busy} loading={busy === "计算分析"} onClick={() => void generateAnalysis()}>计算统计</Button>
@@ -1269,7 +1385,7 @@ export default function App() {
                 >
                   添加文件
                 </Button>
-                <Button className="quiet" icon={FolderOpen} disabled={!!busy} onClick={() => void importChoose(true, true)}>从文件夹添加</Button>
+                <Button className="quiet" icon={FolderOpen} disabled={!!busy} onClick={() => void importChoose(true, true)}>从多个文件夹添加</Button>
                 <Button icon={Sparkles} disabled={!!busy} loading={busy === "载入示例数据"} onClick={() => void loadSample()}>体验示例数据（2份连锁门店月报）</Button>
                 <Button className="quiet" icon={BookOpen} onClick={() => setModal("help")}>快速上手教程</Button>
               </div>
@@ -1667,12 +1783,12 @@ export default function App() {
                   <h2>
                     {tab === "preview"
                       ? "快速检查前 200 条 / 表"
-                      : running ? "正在生成结果预览…" : stoppedTask ? `预览${taskNames[stoppedTask.state]}` : "配置完成后，在这里查看结果"}
+                      : running ? "正在生成汇总结果…" : stoppedTask ? `汇总${taskNames[stoppedTask.state]}` : "配置完成后，在这里查看结果"}
                   </h2>
                   <p>
                     {tab === "preview"
                       ? "先看每张表的前 200 条数据；满意后再合并全部内容。"
-                      : running ? "完成后自动显示全部数据，配置页仍可返回。" : stoppedTask ? stoppedTask.error ?? "配置已保留，可以返回修改或重新预览。" : "返回配置页，确认内容后点击「预览结果」。"}
+                      : running ? "完成后自动显示全部数据，配置页仍可返回。" : stoppedTask ? stoppedTask.error ?? "配置已保留，可以返回修改或重新生成。" : "返回配置页，确认内容后点击「生成汇总结果」。"}
                   </p>
                   {tab === "preview" && !running && (
                     <Button
@@ -1706,6 +1822,20 @@ export default function App() {
               <span>汇总配置</span>
               <span className="muted">自动保存</span>
             </div>
+            <div className="output-config">
+              {mode === "legacy" ? <div className="legacy-config-notice"><p>此方案包含自定义跨 Sheet 分组，已保留原规则。可继续生成，或保存旧方案后按文件重新设置。</p><Button disabled={!!busy} onClick={() => void restartSourceWorkflow()}>保存旧方案并重新设置</Button><button className="text-button" onClick={() => setModal("outputs")}>查看旧分组配置</button></div> : <label className="stacked-label">汇总方式<select value={mode} disabled={!!busy} onChange={(e) => {
+                if (e.target.value === "bySheet") enableOutputs();
+                else { editRoot((root) => ({ ...root, mergeMode: "single" })); setActiveOutputId(""); setPreview(null); }
+              }}><option value="bySheet">同名 Sheet 分别汇总到一个 Excel</option><option value="single">所选 Sheet 合并到一张表</option></select></label>}
+              {activeOutput && <>
+                {outputs.length > 1 ? <label className="stacked-label">这张汇总表的列与整理设置<select value={activeOutput.id} onChange={(e) => selectOutput(e.target.value)}>
+                  {outputs.map((o) => <option key={o.id} value={o.id}>{o.name || "未命名结果表"} · {executionRules(allRules, files, o).sources.filter((s) => s.enabled).length} 张来源表</option>)}
+                </select></label> : <p className="current-output-summary">正在配置：<strong>{activeOutput.name}</strong> · {selectedSheets} 张来源表</p>}
+                <details className="advanced output-name-edit"><summary>修改导出表名</summary><label className="stacked-label">Excel 中显示为<input value={activeOutput.name} aria-describedby={outputProblem ? "output-error" : undefined} onChange={(e) => editRoot((root) => ({ ...root, outputSheets: root.outputSheets.map((o) => o.id === activeOutput.id ? { ...o, name: e.target.value } : o) }))} /></label></details>
+              </>}
+              {mode === "bySheet" && !outputs.length && <p className="muted">在左侧启用文件并勾选 Sheet，同名表会自动汇总在一起。</p>}
+              {outputProblem && <p id="output-error" className="field-error" role="alert">{outputProblem}</p>}
+            </div>
             <div className="panel-tabs">
               {[
                 ["sheets", "表头"],
@@ -1719,8 +1849,8 @@ export default function App() {
                   onClick={() => setPanelTab(id)}
                 >
                   {name}
-                  {id === "fixed" && rules.fixedCells.length ? (
-                    <span>{rules.fixedCells.length}</span>
+                  {id === "fixed" && allRules.fixedCells.length + rules.lookupColumns.length > 0 ? (
+                    <span>{allRules.fixedCells.length + rules.lookupColumns.length}</span>
                   ) : null}
                 </button>
               ))}
@@ -1729,11 +1859,12 @@ export default function App() {
               {panelTab === "sheets" ? (
                 <>
                   <div className="panel-heading">
-                    <h3>表头与读取范围</h3>
-                    <p>框选列名所在的一行或多行，再点「设为表头」。</p>
+                    <h3>确认列名的位置</h3>
+                    <p>单行表头在左侧 Sheet 旁填写行号；多行表头可在原表中框选后设置。</p>
                   </div>
                   {sheet && source ? (
                     <>
+                      {!source.enabled && <p className="muted">此 Sheet 未勾选，不会参与数据汇总；仍可预览或用于提取固定信息。</p>}
                       <div className="header-settings">
                         <div className="setting-row">
                           <span>当前表头</span>
@@ -1751,70 +1882,19 @@ export default function App() {
                         {!source.headerRange && sheet.suggestedHeaderRow !== source.headerRow && (
                           <button
                             className="suggestion-link"
-                            onClick={openReview}
+                            disabled={!source.enabled}
+                            onClick={() => setHeaderRow(sheet.suggestedHeaderRow, true)}
                           >
-                            第 {sheet.suggestedHeaderRow} 行可能才是列名，检查一下
+                            使用识别的第 {sheet.suggestedHeaderRow} 行表头
                           </button>
                         )}
                       </div>
-                      <Button
-                        icon={Copy}
-                        className="full"
-                        onClick={() =>
-                          edit((r) => ({
-                            ...r,
-                            sources: r.sources.map((s) => {
-                              const target = ws?.files
-                                .flatMap((f) => f.sheets)
-                                .find((x) => x.id === s.sheetId);
-                              return target?.name === sheet.name && s.enabled
-                                ? { ...s, headerRow: source.headerRow,headerRange:source.headerRange }
-                                : s;
-                            }),
-                          }))
-                        }
-                      >
-                        应用到勾选的同名表
-                      </Button>
                     </>
                   ) : (
                     <p className="muted">从左侧选择一个工作表。</p>
                   )}
                   <label className="stacked-label">
-                    按表名批量选择
-                    <select
-                      value=""
-                      onChange={(e) => {
-                        if (!e.target.value) return;
-                        const ids =
-                          ws?.files.flatMap((f) =>
-                            f.sheets
-                              .filter((s) => s.name === e.target.value)
-                              .map((s) => s.id),
-                          ) ?? [];
-                        edit((r) => ({
-                          ...r,
-                          sources: r.sources.map((s) => ({
-                            ...s,
-                            enabled: ids.includes(s.sheetId),
-                          })),
-                        }));
-                      }}
-                    >
-                      <option value="">选择要合并的工作表名称</option>
-                      {[
-                        ...new Set(
-                          ws?.files.flatMap((f) =>
-                            f.sheets.map((s) => s.name),
-                          ) ?? [],
-                        ),
-                      ].map((name) => (
-                        <option key={name}>{name}</option>
-                      ))}
-                    </select>
-                  </label>
-                  <label className="stacked-label">
-                    文件列数不同时
+                    来源表的列不完全相同时
                     <select
                       value={rules.mergeStrategy}
                       onChange={(e) =>
@@ -1830,7 +1910,7 @@ export default function App() {
                       type="checkbox"
                       checked={rules.includeSource}
                       onChange={(e) =>
-                        edit((r) => ({ ...r, includeSource: e.target.checked }))
+                        edit((r) => ({ ...r, includeSource: e.target.checked, columns: e.target.checked ? r.columns.map((c) => c.key === "__source" ? { ...c, hidden: false, dataType: "text" } : c) : r.columns }))
                       }
                     />
                     附加来源文件名
@@ -1839,7 +1919,7 @@ export default function App() {
                     <details className="advanced">
                       <summary>自定义这份文件的来源名称</summary>
                       <label className="stacked-label">汇总表中显示为
-                        <input aria-label="来源名称" value={source.sourceName}
+                        <input aria-label="来源名称" disabled={mode !== "legacy" && sheet?.fileId !== firstFile?.id} title="首文件设置会自动用于全部同名 Sheet" value={source.sourceName}
                           onChange={(e) => edit((r) => ({ ...r, sources: r.sources.map((s) =>
                             s.sheetId === activeSheet ? { ...s, sourceName: e.target.value } : s,
                           ) }))} />
@@ -1857,81 +1937,37 @@ export default function App() {
                 <>
                   <div className="panel-heading">
                     <h3>汇总表要保留哪些列？</h3>
-                    <p>勾选要保留的列，改名或用箭头调整顺序。</p>
+                    <p>直接改列名，用箭头排序；不需要的列点“移除”，格式设置按需展开。</p>
                   </div>
-                  {allColumns.map((col, i) => (
+                  <p className="column-count">保留 {keptColumns.length} 列{removedColumns.length ? ` · 已移除 ${removedColumns.length} 列` : ""}</p>
+                  {keptColumns.map((col, i) => (
                     <div className="column-rule" key={col.key}>
                       <div className="column-rule-head">
-                        <input
-                          aria-label={`导出 ${col.name}`}
-                          type="checkbox"
-                          checked={!col.hidden}
-                          onChange={(e) =>
-                            updateColumn(col.key, { hidden: !e.target.checked })
-                          }
-                        />
-                        <input
-                          className="column-name"
-                          aria-label={`列名 ${col.key}`}
-                          value={col.name}
-                          onChange={(e) =>
-                            updateColumn(col.key, { name: e.target.value })
-                          }
-                        />
-                        <button
-                          aria-label={`${col.name} 上移`}
-                          disabled={i === 0}
-                          onClick={() => moveColumn(col.key, -1)}
-                        >
-                          <ArrowUp size={13} />
-                        </button>
-                        <button
-                          aria-label={`${col.name} 下移`}
-                          disabled={i === allColumns.length - 1}
-                          onClick={() => moveColumn(col.key, 1)}
-                        >
-                          <ArrowDown size={13} />
-                        </button>
+                        <span className="column-position" aria-hidden="true">{i + 1}</span>
+                        <input className="column-name" aria-label={`列名 ${col.name}`} value={col.name} onChange={(e) => updateColumn(col.key, { name: e.target.value })} />
+                        <button title="上移" aria-label={`${col.name} 上移`} disabled={i === 0} onClick={() => moveColumn(col.key, -1)}><ArrowUp size={13} /></button>
+                        <button title="下移" aria-label={`${col.name} 下移`} disabled={i === keptColumns.length - 1} onClick={() => moveColumn(col.key, 1)}><ArrowDown size={13} /></button>
+                        <button className="column-remove" title={`从汇总结果中移除 ${col.name}`} aria-label={`移除列 ${col.name}`} onClick={() => removeColumn(col)}><Trash2 size={13} /><span>移除</span></button>
                       </div>
-                      <select
-                        aria-label={`${col.name} 类型`}
-                        value={col.dataType}
-                        onChange={(e) =>
-                          updateColumn(col.key, {
-                            dataType: e.target.value as ColumnRule["dataType"],
-                          })
-                        }
-                      >
-                        {Object.entries(typeNames).map(([v, n]) => (
-                          <option key={v} value={v}>
-                            {n}
-                          </option>
-                        ))}
-                      </select>
-                      {col.dataType === "date" && (
-                        <select
-                          aria-label={`${col.name} 日期格式`}
-                          value={rules.dateFormats[col.key] ?? "auto"}
-                          onChange={(e) =>
-                            edit((r) => ({
-                              ...r,
-                              dateFormats: {
-                                ...r.dateFormats,
-                                [col.key]: e.target.value,
-                              },
-                            }))
-                          }
-                        >
-                          <option value="auto">
-                            自动识别；不能确定时保留原值
-                          </option>
-                          <option value="ymd">年月日</option>
-                          <option value="dmy">日月年</option>
-                          <option value="mdy">月日年</option>
-                        </select>
-                      )}
+                      <details className="column-format" key={`${col.key}:${col.dataType}`} open={col.dataType !== "auto" ? true : undefined}>
+                        <summary>格式：{col.dataType === "auto" ? "保持原样" : col.dataType === "number" ? "数字" : col.dataType === "date" ? "日期" : "文字 / 编号"}</summary>
+                        <label className="stacked-label">按什么格式处理<select aria-label={`${col.name} 类型`} value={col.dataType} onChange={(e) => updateColumn(col.key, { dataType: e.target.value as ColumnRule["dataType"] })}>
+                          {Object.entries(typeNames).filter(([value]) => value !== "skip").map(([value, name]) => <option key={value} value={value}>{name}</option>)}
+                        </select></label>
+                        {col.dataType === "date" && <label className="stacked-label">原表日期顺序<select aria-label={`${col.name} 日期格式`} value={rules.dateFormats[col.key] ?? "auto"} onChange={(e) => edit((r) => ({ ...r, dateFormats: { ...r.dateFormats, [col.key]: e.target.value } }))}>
+                          <option value="auto">自动识别；不能确定时保留原值</option><option value="ymd">年月日</option><option value="dmy">日月年</option><option value="mdy">月日年</option>
+                        </select></label>}
+                      </details>
                     </div>
                   ))}
+                  {columns.length > 0 && !keptColumns.length && <p className="empty-note">所有输出列均已移除，请恢复需要的列后再汇总。</p>}
+                  {removedColumns.length > 0 && <details className="removed-columns">
+                    <summary>已移除的列（{removedColumns.length}）· 可恢复</summary>
+                    {removedColumns.map((col) => <div className="removed-column" key={col.key}><span>{col.name}</span><button className="text-button" onClick={() => {
+                      updateColumn(col.key, { hidden: false, dataType: col.dataType === "skip" ? "auto" : col.dataType });
+                      setNotice({ message: `已恢复「${col.name}」。`, error: false });
+                    }}>恢复</button></div>)}
+                  </details>}
                   <details className="advanced">
                     <summary>不同列名，其实是同一项内容？</summary>
                     <p>例如：把「销售额」归到「金额」，合并后它们放在同一列。这里只指定对应关系；修改上方列名可改显示名称。</p>
@@ -2080,48 +2116,20 @@ export default function App() {
                 </>
               ) : (
                 <>
-                  <div className="panel-heading">
-                    <h3>把表格外的信息带进来</h3>
-                    <p>选择原表中的单个单元格，再点「添加为新列」。</p>
-                  </div>
-                  <Button
-                    icon={MousePointer2}
-                    className="full"
-                    disabled={!sheet}
-                    onClick={() => {
-                      setTab("source");
-                      setPhase("configure");setSelectionError("请在左边原表中选一个单元格，再点击上方的加为新列按钮。");
-                    }}
-                  >
-                    去表格中点选单元格
-                  </Button>
-                  {rules.fixedCells.map((rule) => (
-                    <div className="setting-card" key={rule.id}>
-                      <div className="setting-row">
-                        <strong>{rule.name}</strong>
-                        <button
-                          aria-label={`删除固定值 ${rule.name}`}
-                          onClick={() =>
-                            edit((r) => ({
-                              ...r,
-                              fixedCells: r.fixedCells.filter(
-                                (x) => x.id !== rule.id,
-                              ),
-                            }))
-                          }
-                        >
-                          <Trash2 size={14} />
-                        </button>
-                      </div>
-                      <span className="coordinate-badge">
-                        {rule.sheetName} ! {rule.address}
-                      </span>
-                      <small>每份文件各自读这个位置，再填到该文件的每一行</small>
-                    </div>
-                  ))}
-                  {!rules.fixedCells.length && (
-                    <p className="muted">也适用于写在表格上方的报表日期、部门或负责人。</p>
-                  )}
+                  {mode === "legacy" ? <div className="panel-heading"><h3>旧方案的补充信息</h3><p>固定信息规则已保留。重新设置时可使用直接填写 Sheet 和地址的方式。</p>{rules.fixedCells.map((r) => <p key={r.id}>{r.name}：{r.sheetName}!{r.address}</p>)}</div> : <FixedInfoColumns rules={allRules} files={files} groupNames={[...new Set([...allRules.outputSheets.map((o) => o.sourceSheetName).filter((name): name is string => !!name), ...selectedSheetNames])]}
+                    onChange={(fixedCells) => editRoot((root) => {
+                      const rename = (cols: ColumnRule[]) => cols.map((column) => {
+                        const old = root.fixedCells.find((r) => `fixed:${r.id}` === column.key);
+                        const next = old && fixedCells.find((r) => r.id === old.id);
+                        return old && next && column.name === old.name ? { ...column, name: next.name } : column;
+                      });
+                      return { ...root, fixedCells, columns: rename(root.columns), outputSheets: root.outputSheets.map((o) => ({ ...o, rules: { ...o.rules, columns: rename(o.rules.columns) } })) };
+                    })} onPick={() => {
+                      setTab("source"); setPhase("configure"); setSelectionError("在原表选中信息单元格，再点上方“添加为新列”。");
+                    }} />}
+                  <details className="advanced"><summary>高级：按编号逐行匹配信息{rules.lookupColumns.length ? `（${rules.lookupColumns.length} 列）` : ""}</summary>
+                    <LookupColumns key={activeOutput?.id ?? "single"} rules={rules} files={files} columns={columns} onChange={(lookupColumns) => edit((r) => ({ ...r, lookupColumns }))} />
+                  </details>
                 </>
               )}
             </div>
@@ -2132,8 +2140,9 @@ export default function App() {
                 loading={busy === "规则预览"}
                 onClick={() => void previewRules()}
               >
-                检查前 200 条 / 表
+                快速检查当前表
               </Button>
+              <small>每张来源表的前 200 行；完整汇总请点右上角“生成汇总结果”。</small>
             </div>
           </aside>
         )}
@@ -2170,6 +2179,31 @@ export default function App() {
           处理记录 <ChevronUp size={14} />
         </button>
       </footer>
+      {modal === "outputs" && <OutputManager rules={allRules} files={ws?.files ?? []} activeId={activeOutput?.id ?? ""}
+        onChange={(next) => { dispatch({ kind: "edit", edit: () => next }); setPreview(null); }} onSelect={selectOutput} onClose={() => setModal(null)} />}
+      {modal === "config-check" && preview && <ConfigCheck dataset={preview} name={activeOutput?.name ?? "当前汇总表"} onClose={() => setModal(null)} />}
+      {modal === "folders" && (
+        <Modal title="勾选要导入的文件夹" onClose={() => setModal(null)}>
+          <div className="modal-body">
+            <p>导入所选文件夹内的 Excel / CSV 文件，不包含子文件夹。可继续添加不同位置的文件夹。</p>
+            <div className="toolbar-group"><Button icon={FolderOpen} disabled={!!busy} onClick={async () => {
+              try {
+                const paths = await chooseFiles(true);
+                const existing = new Set(folderPaths.map((p) => p.toLowerCase()));
+                const added = paths.filter((p) => !existing.has(p.toLowerCase()));
+                setFolderPaths((old) => [...old, ...added]); setCheckedFolders((old) => [...old, ...added]);
+              } catch (e) { error(e); }
+            }}>继续添加文件夹</Button><Button onClick={() => setCheckedFolders(folderPaths)}>全选</Button><Button onClick={() => setCheckedFolders([])}>取消全选</Button></div>
+            <div className="folder-selection">{folderPaths.map((path) => <label key={path} title={path}>
+              <input type="checkbox" checked={checkedFolders.includes(path)} onChange={(e) => setCheckedFolders((old) => e.target.checked ? [...old, path] : old.filter((p) => p !== path))} />
+              <span>{path}</span>
+            </label>)}</div>
+            {noticeBox}
+          </div>
+          <div className="modal-footer"><Button disabled={!!busy} onClick={() => setModal(null)}>取消</Button>
+            <Button primary icon={Upload} disabled={!checkedFolders.length || !!busy} loading={busy === "导入文件"} onClick={() => void importPaths(checkedFolders)}>导入所选 {checkedFolders.length} 个文件夹</Button></div>
+        </Modal>
+      )}
       {modal === "imports" && (
         <Modal title="导入结果" onClose={() => setModal(null)}>
           <div className="modal-body">
@@ -2306,7 +2340,7 @@ export default function App() {
             <Button
               primary
               onClick={() => {
-                edit((r) => ({
+                editRoot((r) => ({
                   ...r,
                   fixedCells: [
                     ...r.fixedCells,
@@ -2316,6 +2350,7 @@ export default function App() {
                         saveName.trim() ||
                         `${fixedCandidate.sheet.name} ${coordinate(fixedCandidate.row, fixedCandidate.column)}`,
                       sheetName: fixedCandidate.sheet.name,
+                      targetSheets: [],
                       address: coordinate(
                         fixedCandidate.row,
                         fixedCandidate.column,
@@ -2339,7 +2374,8 @@ export default function App() {
             <div className="cell-preview"><span>已框选 {rangeLabel(headerCandidate.range)}</span><strong>{headerCandidate.range.endRow-headerCandidate.range.startRow+1} 行表头 · {headerCandidate.columns.length} 列</strong></div>
             <p>下面是合并后的列名。多层标题用「/」连接；数据从第 {headerCandidate.range.endRow+1} 行开始读取。</p>
             <div className="header-name-preview">{headerCandidate.columns.map((col) => <span key={col.key}>{col.name}</span>)}</div>
-            {selectedItems.filter((item) => item.sheet.id!==sheet?.id && item.sheet.name===sheet?.name).length > 0 && <label className="option-row">
+            {mode !== "legacy" && <p className="muted">所有文件的同名 Sheet 会自动使用相同表头，无需再次复制配置。</p>}
+            {mode === "legacy" && selectedItems.filter((item) => item.sheet.id!==sheet?.id && item.sheet.name===sheet?.name).length > 0 && <label className="option-row">
               <input type="checkbox" checked={headerScope} onChange={(e) => { setHeaderScope(e.target.checked);setSelectionError(""); }} />
               <span>同时用于其余 {selectedItems.filter((item) => item.sheet.id!==sheet?.id && item.sheet.name===sheet?.name).length} 张「{sheet?.name}」表<small>各文件都使用相同的行列位置，无需逐个重复选择。</small></span>
             </label>}
@@ -2432,7 +2468,7 @@ export default function App() {
           </div>
           <div className="modal-footer">
             <Button onClick={() => setModal(null)}>返回</Button>
-            <Button primary disabled={!schemeId || !!busy || !selectedSheets} loading={busy === "应用方案"} onClick={() => void applyScheme()}>使用所选设置</Button>
+            <Button primary disabled={!schemeId || !!busy || !selectedFiles.length} loading={busy === "应用方案"} onClick={() => void applyScheme()}>使用所选设置</Button>
           </div>
         </Modal>
       )}
@@ -2550,6 +2586,7 @@ export default function App() {
               >
                 ZIP 合集
               </Button>
+              <Button icon={Layers} disabled={!selectedResults.length || !!busy} loading={busy === "导出多表 Excel"} onClick={() => void exportWorkbook(selectedResults)}>保存为一个多 Sheet Excel</Button>
               <Button
                 danger
                 disabled={!selectedResults.length || !!busy}
@@ -2579,6 +2616,7 @@ export default function App() {
                     className="history-name"
                     onClick={() => {
                       setResultId(ds.id);
+                      setRequestedTaskId(ws?.tasks.find((t) => t.datasetIds.includes(ds.id) || t.datasetId === ds.id)?.id ?? null);
                       setQuery(queryFor(ds.id));
                       setTab("result");setPhase("results");
                       setModal(null);
@@ -2661,6 +2699,7 @@ export default function App() {
                   <Button
                     onClick={() => {
                       setResultId(task.datasetId);
+                      setRequestedTaskId(task.id);
                       setQuery(queryFor(task.datasetId!));
                       setTab("result");setPhase("results");
                       setModal(null);
@@ -2718,12 +2757,14 @@ export default function App() {
                       <td>
                         <Button
                           onClick={() => {
+                            const target = files.flatMap((f) => f.sheets).find((s) => s.id === issue.sheetId);
                             setActiveSheet(issue.sheetId);
-                            setFocusRow(issue.row);
+                            setFocusRow(Math.min(issue.row, target?.rows || 1));
                             setTab("source");
+                            setPhase("configure"); setHomeView(false);
                             setModal(null);
                             setNotice({
-                              message: `异常位于第 ${issue.row} 行，列「${issue.column}」，可在源工作表查看。`,
+                              message: target?.name !== issue.sheetName || issue.row > target.rows ? issue.message : `异常位于 ${issue.sheetName} 第 ${issue.row} 行，列「${issue.column}」，可在源工作表查看。`,
                               error: false,
                             });
                           }}
@@ -3137,6 +3178,23 @@ export default function App() {
           </div>
         </Modal>
       )}
+      {modal === "export-saved" && savedExport && (
+        <Modal title="保存成功" onClose={closeSavedExport}>
+          <div className="modal-body">
+            <p>{savedExport.message}</p>
+            <p className="muted" style={{ overflowWrap: "anywhere" }}>{savedExport.path}</p>
+            <p>是否打开输出目录？</p>
+            {notice?.error && noticeBox}
+          </div>
+          <div className="modal-footer">
+            <Button disabled={!!busy} onClick={closeSavedExport}>暂不打开</Button>
+            <Button icon={FolderOpen} primary disabled={!!busy} loading={busy === "打开输出目录"} onClick={() => void action("打开输出目录", async () => {
+              await call("open_path", { path: savedExport.path, select: true });
+              closeSavedExport();
+            })}>打开输出目录</Button>
+          </div>
+        </Modal>
+      )}
       {confirm && (
         <Modal title="确认删除" onClose={() => setConfirm(null)}>
           <div className="modal-body">
@@ -3184,7 +3242,7 @@ export default function App() {
             localStorage.setItem("gridflow_tour_completed", "true");
           } catch {}
           setNotice({
-            message: "🎉 新手实操引导完成！现在试着框选表头或点击「预览结果」吧。",
+            message: "新手引导已完成。现在可以设置表头，或点击「生成汇总结果」。",
             error: false,
           });
         }}

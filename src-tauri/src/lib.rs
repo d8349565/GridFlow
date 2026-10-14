@@ -5,6 +5,7 @@ mod desktop;
 pub mod engine;
 pub mod export;
 pub mod model;
+pub mod workflow;
 pub mod reader;
 pub mod appearance;
 mod xls_appearance;

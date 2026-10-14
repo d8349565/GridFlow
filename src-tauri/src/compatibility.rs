@@ -121,6 +121,7 @@ pub fn convert(value: Value) -> Result<(RuleSet, Vec<SheetPreset>)> {
                     },
                     sheet_name,
                     address,
+                    target_sheets: vec![],
                 });
             }
         }
@@ -138,6 +139,7 @@ pub fn convert(value: Value) -> Result<(RuleSet, Vec<SheetPreset>)> {
                 name: text(rule, "newColumnName", "column_name", "固定值"),
                 sheet_name: text(rule, "sheetName", "sheet_name", "Sheet1"),
                 address: crate::reader::cell_address(row, col),
+                target_sheets: vec![],
             });
         }
     }
@@ -152,18 +154,19 @@ pub fn convert(value: Value) -> Result<(RuleSet, Vec<SheetPreset>)> {
                         .unwrap_or_else(|| text(sheet, "name", "sheet_name", "Sheet1"));
                     let header_row =
                         sheet.get("headerRow").and_then(Value::as_u64).unwrap_or(1) as usize;
-                    let enabled = file.get("enabled").and_then(Value::as_bool).unwrap_or(true)
-                        && sheet
+                    let enabled = sheet
                             .get("enabled")
                             .and_then(Value::as_bool)
                             .unwrap_or(true);
-                    if !presets.iter().any(|p: &SheetPreset| p.name == name) {
+                    if !presets.iter().any(|p: &SheetPreset| p.name == name && p.file_id.as_deref() == file.get("fileId").and_then(Value::as_str)) {
                         presets.push(SheetPreset {
                             name,
                             header_row,
                             enabled,
                             workbook_sheets: vec![],
                             header_range: None,
+                            file_id: file.get("fileId").and_then(Value::as_str).map(String::from),
+                            file_name: file.get("fileName").and_then(Value::as_str).map(String::from), file_enabled: file.get("enabled").and_then(Value::as_bool), source_name: sheet.get("sourceName").and_then(Value::as_str).map(String::from),
                         });
                     }
                 }
@@ -174,6 +177,7 @@ pub fn convert(value: Value) -> Result<(RuleSet, Vec<SheetPreset>)> {
                     enabled: true,
                     workbook_sheets: vec![],
                     header_range: None,
+                    file_id: None, file_name: None, file_enabled: None, source_name: None,
                 });
             }
         }
@@ -193,6 +197,7 @@ pub fn convert(value: Value) -> Result<(RuleSet, Vec<SheetPreset>)> {
                     enabled: true,
                     workbook_sheets: vec![],
                     header_range: None,
+                    file_id: None, file_name: None, file_enabled: None, source_name: None,
                 });
             }
         }

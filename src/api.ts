@@ -22,9 +22,10 @@ export { isTauri };
 export async function chooseFiles(
   directory = false,
   configuration = false,
+  multiple = true,
 ): Promise<string[]> {
   const result = await open({
-    multiple: !directory,
+    multiple,
     directory,
     filters: directory
       ? undefined
@@ -82,10 +83,14 @@ export function queryFor(id: string): DatasetQuery {
 export function defaultRules(): RuleSet {
   return {
     version: 2,
+    mergeMode: "bySheet",
+    fileSelections: [],
     sources: [],
     columns: [],
     mappings: [],
     fixedCells: [],
+    lookupColumns: [],
+    outputSheets: [],
     mergeStrategy: "outer",
     removeEmptyRows: false,
     removeDuplicates: false,
