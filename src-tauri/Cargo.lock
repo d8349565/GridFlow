@@ -1356,7 +1356,7 @@ dependencies = [
 
 [[package]]
 name = "excel-workbench"
-version = "2.0.0"
+version = "2.1.1"
 dependencies = [
  "argon2",
  "calamine",
