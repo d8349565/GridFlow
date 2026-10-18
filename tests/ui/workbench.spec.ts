@@ -449,7 +449,7 @@ test("rectangle selection supports multirow headers and returning to configurati
 
 test("import disclosure is reachable by keyboard and restores focus", async ({ page }) => {
   await page.goto("/");await page.getByRole("button",{ name: "添加文件",exact: true }).click();
-  const disclosure = page.getByLabel("更多导入方式");
+  const disclosure = page.getByLabel("更多文件操作");
   await disclosure.focus();await page.keyboard.press("Enter");
   await expect(page.getByRole("button",{ name: "添加文件夹",exact: true })).toBeVisible();
   await page.keyboard.press("Tab");await expect(page.getByRole("button",{ name: "添加文件夹",exact: true })).toBeFocused();

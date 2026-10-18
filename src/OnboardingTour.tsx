@@ -13,7 +13,7 @@ export const TOUR_STEPS: TourStep[] = [
   {
     selector: '[data-tour="file-sidebar"]',
     title: "按文件配置工作表",
-    description: "展开文件，勾选需要汇总的 Sheet，直接填写表头行和来源名称。只需设置首个参与汇总的文件，其余文件的同名表会自动跟随，无需复制。文件开关会保留 Sheet 选择。",
+    description: "展开文件，勾选需要汇总的 Sheet，填写表头行和来源名称。同名汇总时，其余文件自动跟随首文件；合并到一张表时，可独立勾选不同名称的 Sheet。文件开关会保留 Sheet 选择。",
     placement: "right",
   },
   {

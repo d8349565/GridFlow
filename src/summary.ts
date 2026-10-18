@@ -72,16 +72,18 @@ export function templateFile(root: RuleSet, files: SourceFile[]): SourceFile | u
   return files.find((f) => fileEnabled(root, f.id));
 }
 export function syncFirstFile(root: RuleSet, files: SourceFile[]): RuleSet {
-  if (mergeMode(root) === "legacy") return root;
+  return mergeMode(root) === "bySheet" ? applyFirstFileSettings(root, files, false) : root;
+}
+export function applyFirstFileSettings(root: RuleSet, files: SourceFile[], matchingOnly = true): RuleSet {
   const first = templateFile(root, files);
   if (!first) return root;
   const settings = new Map(first.sheets.map((s) => [s.name, root.sources.find((r) => r.sheetId === s.id)]));
   const sheets = new Map(files.flatMap((f) => f.sheets.map((s) => [s.id, { sheet: s, file: f }] as const)));
   return { ...root, sources: root.sources.map((source) => {
     const entry = sheets.get(source.sheetId);
-    if (!entry || entry.file.id === first.id) return source;
+    if (!entry || entry.file.id === first.id || (matchingOnly && !fileEnabled(root, entry.file.id))) return source;
     const template = settings.get(entry.sheet.name);
-    if (!template) return { ...source, enabled: false };
+    if (!template) return matchingOnly ? source : { ...source, enabled: false };
     const firstStem = first.name.replace(/\.(xlsx?|csv)$/i, "");
     const sourceName = template.sourceName.includes(first.name) ? template.sourceName.split(first.name).join(entry.file.name)
       : firstStem ? template.sourceName.split(firstStem).join(entry.file.name.replace(/\.(xlsx?|csv)$/i, "")) : template.sourceName;
@@ -89,7 +91,7 @@ export function syncFirstFile(root: RuleSet, files: SourceFile[]): RuleSet {
   }) };
 }
 export function templateProblems(root: RuleSet, files: SourceFile[]): string[] {
-  if (mergeMode(root) === "legacy") return [];
+  if (mergeMode(root) !== "bySheet") return [];
   const first = templateFile(root, files);
   if (!first) return [];
   const selected = first.sheets.flatMap((sheet) => {

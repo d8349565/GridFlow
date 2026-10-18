@@ -37,7 +37,7 @@ export default function HelpModal({
     {
       icon: Table2,
       title: "按文件选择 Sheet 和表头",
-      body: "展开文件，勾选要汇总的 Sheet，直接填写表头行。首个参与汇总的文件配置好后，会自动应用到所有文件的同名 Sheet；多行表头仍可在原表中框选。",
+      body: "展开文件，勾选要汇总的 Sheet，直接填写表头行。同名 Sheet 分别汇总时，首文件设置会自动用于其余文件；合并到一张表时，可独立勾选不同名称的 Sheet。多行表头仍可在原表中框选。",
     },
     {
       icon: Plus,
@@ -47,7 +47,7 @@ export default function HelpModal({
     {
       icon: Play,
       title: "预览结果与保存导出",
-      body: "点击“生成汇总结果”（Ctrl+Enter）。所选同名 Sheet 自动分别汇总；完成后点击“保存全部”，即可得到一个包含多张结果表的 Excel。",
+      body: "按需选择“同名 Sheet 分别汇总到一个 Excel”或“所选 Sheet 合并到一张表”，再点击“生成汇总结果”（Ctrl+Enter）。完成后可保存当前结果或全部结果。",
     },
   ];
 

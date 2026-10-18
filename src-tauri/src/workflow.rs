@@ -9,7 +9,7 @@ pub fn file_enabled(rules: &RuleSet, file_id: &str) -> bool {
     rules.file_selections.iter().find(|f| f.file_id == file_id).is_none_or(|f| f.enabled)
 }
 fn sync_first_file(rules: &mut RuleSet, files: &[SourceFile]) {
-    if mode(rules) == "legacy" { return; }
+    if mode(rules) != "bySheet" { return; }
     let Some(first) = files.iter().find(|f| file_enabled(rules, &f.id)) else { return; };
     let settings = first.sheets.iter().filter_map(|sheet| rules.sources.iter().find(|s| s.sheet_id == sheet.id).map(|s| (sheet.name.clone(), s.clone()))).collect::<HashMap<_, _>>();
     let first_stem = std::path::Path::new(&first.name).file_stem().unwrap_or_default().to_string_lossy();
@@ -27,7 +27,7 @@ fn sync_first_file(rules: &mut RuleSet, files: &[SourceFile]) {
     }
 }
 pub fn validate_template(rules: &RuleSet, files: &[SourceFile]) -> Result<()> {
-    if mode(rules) == "legacy" { return Ok(()); }
+    if mode(rules) != "bySheet" { return Ok(()); }
     let Some(first) = files.iter().find(|f| file_enabled(rules, &f.id)) else { return Ok(()); };
     for sheet in &first.sheets {
         let Some(source) = rules.sources.iter().find(|s| s.sheet_id == sheet.id && s.enabled) else { continue; };

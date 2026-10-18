@@ -60,7 +60,7 @@ export default function SourceFileList({ files, sources, fileSelections, activeS
         <small className="source-sheet-count" title={info}>{count}/{file.sheets.length}</small>
         <button className="source-file-delete" title="删除导入副本" disabled={disabled} aria-label={`删除 ${file.name}`} onClick={() => onDelete(file.id)}><Trash2 size={13} /></button>
       </div>
-      {open && <div className="source-file-sheets"><small className="source-config-note">{file.id === templateId ? "统一配置：修改后自动用于全部文件的同名 Sheet" : "自动跟随首文件设置，可预览此文件"}</small>{file.sheets.map((sheet) => <SheetRow key={sheet.id} file={file} sheet={sheet} source={selections.get(sheet.id)} enabled={enabled} disabled={disabled || (!!templateId && file.id !== templateId)} active={sheet.id === activeSheet} onChange={onSourceChange} onPreview={onPreview} />)}</div>}
+      {open && <div className="source-file-sheets"><small className="source-config-note">{!templateId ? "勾选需要合并的 Sheet，可分别设置表头与来源名称" : file.id === templateId ? "统一配置：修改后自动用于全部文件的同名 Sheet" : "自动跟随首文件设置，可预览此文件"}</small>{file.sheets.map((sheet) => <SheetRow key={sheet.id} file={file} sheet={sheet} source={selections.get(sheet.id)} enabled={enabled} disabled={disabled || (!!templateId && file.id !== templateId)} active={sheet.id === activeSheet} onChange={onSourceChange} onPreview={onPreview} />)}</div>}
     </div>;
   })}</div>;
 }

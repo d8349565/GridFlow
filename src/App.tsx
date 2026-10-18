@@ -66,7 +66,7 @@ import LookupColumns from "./LookupColumns";
 import OutputManager from "./OutputManager";
 import ConfigCheck from "./ConfigCheck";
 import FixedInfoColumns from "./FixedInfoColumns";
-import { activeOutputs, editConfiguration, executionRules, fileEnabled, mergeMode, removeOutputColumn, syncGroups, syncOutputSources, outputError, templateFile, templateProblems } from "./summary";
+import { activeOutputs, applyFirstFileSettings, editConfiguration, executionRules, fileEnabled, mergeMode, removeOutputColumn, syncGroups, syncOutputSources, outputError, templateFile, templateProblems } from "./summary";
 import OnboardingTour from "./OnboardingTour";
 import HelpModal from "./HelpModal";
 import {
@@ -678,6 +678,27 @@ export default function App() {
     }
     if (paths.length) await importPaths(paths, append);
   }
+  function applyFirstFileToMatchingSheets() {
+    if (busyRef.current || mode !== "single" || !firstFile) return;
+    const next = applyFirstFileSettings(allRules, files);
+    const targets = next.sources.filter((source, index) => source !== allRules.sources[index]);
+    if (!targets.length) {
+      setNotice({ message: "其他启用文件中没有与首文件同名的 Sheet。", error: false }); return;
+    }
+    const sheets = new Map(files.flatMap((file) => file.sheets.map((sheet) => [sheet.id, { file, sheet }] as const)));
+    const invalid = targets.find((source) => {
+      const sheet = sheets.get(source.sheetId)!.sheet;
+      return source.enabled && (!sheet.width || !Number.isInteger(source.headerRow) || source.headerRow < 1 || source.headerRow > sheet.rows
+        || (source.headerRange && (source.headerRange.endRow > sheet.rows || source.headerRange.endColumn > sheet.width)));
+    });
+    if (invalid) {
+      const target = sheets.get(invalid.sheetId)!;
+      setNotice({ message: `${target.file.name} / ${target.sheet.name} 无法使用首文件的表头范围，本次未应用配置，请检查后重试。`, error: true }); return;
+    }
+    editRoot(() => next);
+    setPreview(null); setSelectionError("");
+    setNotice({ message: `已将「${firstFile.name}」的勾选、表头和来源设置应用到 ${targets.length} 张同名 Sheet，可按 Ctrl+Z 撤销。`, error: false });
+  }
   async function importPaths(paths: string[], append = true) {
     await action("导入文件", async () => {
       await call("save_draft", { rules: latestRules.current, activeSheetId: latestActive.current });
@@ -863,7 +884,7 @@ export default function App() {
   function applyHeader() {
     if (!headerCandidate || !sheet) return;
     const area=headerCandidate.range;
-    const targets=selectedItems.filter((item) => item.sheet.id===sheet.id || ((mode !== "legacy" || headerScope) && item.sheet.name===sheet.name));
+    const targets=selectedItems.filter((item) => item.sheet.id===sheet.id || ((mode === "bySheet" || headerScope) && item.sheet.name===sheet.name));
     const bad=targets.filter((item) => item.sheet.rows<area.endRow || item.sheet.width<area.endColumn);
     if (bad.length) { setSelectionError(`选区超出 ${bad[0].file.name} 的范围。可以取消批量应用，单独设置此表。`); return; }
     const ids=new Set(targets.map((item) => item.sheet.id)); ids.add(sheet.id);
@@ -1282,14 +1303,17 @@ export default function App() {
           <div className="file-actions">
             <Button icon={Plus} loading={busy === "导入文件"} disabled={!!busy} onClick={() => void importChoose()}>添加文件</Button>
             <details className="import-menu" onBlur={(e) => { if (!e.currentTarget.contains(e.relatedTarget as Node | null)) e.currentTarget.open = false; }} onKeyDown={(e) => { if (e.key === "Escape") { e.currentTarget.open = false;e.currentTarget.querySelector("summary")?.focus(); } }}>
-              <summary aria-label="更多导入方式" title="添加文件夹或换一批文件"><ChevronDown size={15} /></summary>
+              <summary aria-label="更多文件操作" title="文件导入与批量配置"><ChevronDown size={15} /></summary>
               <div className="import-options">
                 <Button icon={FolderOpen} disabled={!!busy} onClick={(e) => { e.currentTarget.closest("details")!.open = false;void importChoose(true, true); }}>添加多个文件夹</Button>
                 <Button icon={RefreshCw} disabled={!!busy} title="更换本次文件，之前的文件和结果仍保留" onClick={(e) => { e.currentTarget.closest("details")!.open = false;void importChoose(false, false); }}>换一批文件</Button>
+                {mode === "single" && <Button icon={Copy} disabled={!!busy || selectedFiles.length < 2}
+                  title={firstFile ? `将「${firstFile.name}」的 Sheet 勾选、表头和来源设置应用到其他启用文件的同名 Sheet` : "请先启用至少两个文件"}
+                  onClick={(e) => { const menu = e.currentTarget.closest("details")!; menu.open = false;menu.querySelector("summary")?.focus();applyFirstFileToMatchingSheets(); }}>应用首文件配置</Button>}
               </div>
             </details>
           </div>
-          <SourceFileList files={files} sources={mode === "legacy" ? rules.sources : allRules.sources} fileSelections={allRules.fileSelections} activeSheet={activeSheet} templateId={firstFile?.id} disabled={!!busy || mode === "legacy"}
+          <SourceFileList files={files} sources={mode === "legacy" ? rules.sources : allRules.sources} fileSelections={allRules.fileSelections} activeSheet={activeSheet} templateId={mode === "bySheet" ? firstFile?.id : undefined} disabled={!!busy || mode === "legacy"}
             onFileSelect={(fileId, enabled) => editRoot((root) => ({ ...root, fileSelections: files.map((f) => ({ fileId: f.id, enabled: f.id === fileId ? enabled : fileEnabled(root, f.id) })) }))}
             onSourceChange={(sheetId, patch) => {
               editRoot((root) => ({ ...root, sources: root.sources.map((s) => s.sheetId === sheetId ? { ...s, ...patch } : s) }));
@@ -1832,6 +1856,7 @@ export default function App() {
                 if (e.target.value === "bySheet") enableOutputs();
                 else { editRoot((root) => ({ ...root, mergeMode: "single" })); setActiveOutputId(""); setPreview(null); }
               }}><option value="bySheet">同名 Sheet 分别汇总到一个 Excel</option><option value="single">所选 Sheet 合并到一张表</option></select></label>}
+              {mode === "single" && <p className="muted">可逐个文件勾选任意名称的 Sheet，按列名合并到一张表。</p>}
               {activeOutput && <>
                 {outputs.length > 1 ? <label className="stacked-label">这张汇总表的列与整理设置<select value={activeOutput.id} onChange={(e) => selectOutput(e.target.value)}>
                   {outputs.map((o) => <option key={o.id} value={o.id}>{o.name || "未命名结果表"} · {executionRules(allRules, files, o).sources.filter((s) => s.enabled).length} 张来源表</option>)}
@@ -1924,7 +1949,7 @@ export default function App() {
                     <details className="advanced">
                       <summary>自定义这份文件的来源名称</summary>
                       <label className="stacked-label">汇总表中显示为
-                        <input aria-label="来源名称" disabled={mode !== "legacy" && sheet?.fileId !== firstFile?.id} title="首文件设置会自动用于全部同名 Sheet" value={source.sourceName}
+                        <input aria-label="来源名称" disabled={mode === "bySheet" && sheet?.fileId !== firstFile?.id} title={mode === "bySheet" ? "首文件设置会自动用于全部同名 Sheet" : "自定义此 Sheet 在汇总表中显示的来源名称"} value={source.sourceName}
                           onChange={(e) => edit((r) => ({ ...r, sources: r.sources.map((s) =>
                             s.sheetId === activeSheet ? { ...s, sourceName: e.target.value } : s,
                           ) }))} />
@@ -2380,8 +2405,8 @@ export default function App() {
             <div className="cell-preview"><span>已框选 {rangeLabel(headerCandidate.range)}</span><strong>{headerCandidate.range.endRow-headerCandidate.range.startRow+1} 行表头 · {headerCandidate.columns.length} 列</strong></div>
             <p>下面是合并后的列名。多层标题用「/」连接；数据从第 {headerCandidate.range.endRow+1} 行开始读取。</p>
             <div className="header-name-preview">{headerCandidate.columns.map((col) => <span key={col.key}>{col.name}</span>)}</div>
-            {mode !== "legacy" && <p className="muted">所有文件的同名 Sheet 会自动使用相同表头，无需再次复制配置。</p>}
-            {mode === "legacy" && selectedItems.filter((item) => item.sheet.id!==sheet?.id && item.sheet.name===sheet?.name).length > 0 && <label className="option-row">
+            {mode === "bySheet" && <p className="muted">所有文件的同名 Sheet 会自动使用相同表头，无需再次复制配置。</p>}
+            {mode !== "bySheet" && selectedItems.filter((item) => item.sheet.id!==sheet?.id && item.sheet.name===sheet?.name).length > 0 && <label className="option-row">
               <input type="checkbox" checked={headerScope} onChange={(e) => { setHeaderScope(e.target.checked);setSelectionError(""); }} />
               <span>同时用于其余 {selectedItems.filter((item) => item.sheet.id!==sheet?.id && item.sheet.name===sheet?.name).length} 张「{sheet?.name}」表<small>各文件都使用相同的行列位置，无需逐个重复选择。</small></span>
             </label>}
