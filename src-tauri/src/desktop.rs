@@ -1,8 +1,101 @@
 use crate::{engine::Engine, model::*};
 use std::{path::PathBuf, sync::Arc};
 use tauri::{Manager, State};
+use crate::rename::*;
 
 type Core<'a> = State<'a, Arc<Engine>>;
+type Renamer<'a> = State<'a, Arc<RenameService>>;
+#[tauri::command]
+async fn rename_presets(core:Core<'_>) -> Result<Vec<crate::rename_config::RenamePresetSummary>> {
+    core.guard()?;let core=core.inner().clone();
+    tauri::async_runtime::spawn_blocking(move ||crate::rename_config::presets(&core)).await.map_err(join_error)?
+}
+#[tauri::command]
+async fn rename_save_preset(core:Core<'_>,preset_id:Option<String>,name:String,rules:RenameRules) -> Result<crate::rename_config::RenamePresetSummary> {
+    core.guard()?;let core=core.inner().clone();
+    tauri::async_runtime::spawn_blocking(move ||crate::rename_config::save_preset(&core,preset_id,&name,&rules)).await.map_err(join_error)?
+}
+#[tauri::command]
+async fn rename_load_preset(core:Core<'_>,preset_id:String) -> Result<crate::rename_config::RenamePreset> {
+    core.guard()?;let core=core.inner().clone();
+    tauri::async_runtime::spawn_blocking(move ||crate::rename_config::load_preset(&core,&preset_id)).await.map_err(join_error)?
+}
+#[tauri::command]
+async fn rename_import_preset(core:Core<'_>,path:String,password:String) -> Result<crate::rename_config::RenamePreset> {
+    core.guard()?;let core=core.inner().clone();
+    tauri::async_runtime::spawn_blocking(move ||{let password=zeroize::Zeroizing::new(password);crate::rename_config::import_preset(&core,std::path::Path::new(&path),&password)}).await.map_err(join_error)?
+}
+#[tauri::command]
+async fn rename_save_config(core: Core<'_>, path: String, password: String, rules: RenameRules) -> Result<()> {
+    core.guard()?;
+    tauri::async_runtime::spawn_blocking(move || { let password=zeroize::Zeroizing::new(password); crate::rename_config::save(std::path::Path::new(&path),&password,&rules) }).await.map_err(join_error)?
+}
+#[tauri::command]
+async fn rename_load_config(core: Core<'_>, path: String, password: String) -> Result<RenameRules> {
+    core.guard()?;
+    tauri::async_runtime::spawn_blocking(move || { let password=zeroize::Zeroizing::new(password); crate::rename_config::load(std::path::Path::new(&path),&password) }).await.map_err(join_error)?
+}
+#[tauri::command]
+async fn rename_save_draft(core: Core<'_>, rules: RenameRules) -> Result<()> {
+    core.guard()?; let root=core.root.clone();
+    tauri::async_runtime::spawn_blocking(move || crate::rename_config::save_draft(&root,&rules)).await.map_err(join_error)?
+}
+#[tauri::command]
+async fn rename_load_draft(core: Core<'_>) -> Result<Option<RenameRules>> {
+    core.guard()?; let root=core.root.clone();
+    tauri::async_runtime::spawn_blocking(move || crate::rename_config::load_draft(&root)).await.map_err(join_error)?
+}
+#[tauri::command]
+fn rename_files(core: Core<'_>, renamer: Renamer<'_>) -> Result<Vec<RenameFile>> { core.guard()?; Ok(renamer.files()) }
+#[tauri::command]
+async fn rename_scan(core: Core<'_>, renamer: Renamer<'_>, paths: Vec<String>, recursive: bool) -> Result<RenameScan> {
+    core.guard()?; let service = renamer.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || service.scan(paths, recursive)).await.map_err(join_error)?
+}
+#[tauri::command]
+async fn rename_sheet_names(core: Core<'_>, renamer: Renamer<'_>, file_id: String) -> Result<Vec<String>> {
+    core.guard()?; let service = renamer.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || service.sheet_names(&file_id)).await.map_err(join_error)?
+}
+#[tauri::command]
+async fn rename_page(core: Core<'_>, renamer: Renamer<'_>, file_id: String, sheet: String, offset: usize, limit: usize) -> Result<RenamePage> {
+    core.guard()?; let service = renamer.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || service.page(&file_id, &sheet, offset, limit)).await.map_err(join_error)?
+}
+#[tauri::command]
+async fn rename_live(core: Core<'_>, renamer: Renamer<'_>, file_id: String, rules: RenameRules) -> Result<RenameRow> {
+    core.guard()?; let service = renamer.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || service.live(&file_id, &rules)).await.map_err(join_error)?
+}
+#[tauri::command]
+async fn rename_prepare(core: Core<'_>, renamer: Renamer<'_>, ids: Vec<String>, rules: RenameRules, output:Option<RenameOutput>) -> Result<RenamePlan> {
+    core.guard()?; let service = renamer.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || service.prepare_to(ids, rules,output.unwrap_or_default())).await.map_err(join_error)?
+}
+#[tauri::command]
+async fn rename_execute(core: Core<'_>, renamer: Renamer<'_>, plan_id: String) -> Result<RenamePlan> {
+    core.guard()?; let service = renamer.inner().clone(); let root = core.root.clone();
+    tauri::async_runtime::spawn_blocking(move || service.execute(&plan_id, &root)).await.map_err(join_error)?
+}
+#[tauri::command]
+fn rename_progress(core: Core<'_>, renamer: Renamer<'_>) -> Result<RenameProgress> { core.guard()?; Ok(renamer.progress()) }
+#[tauri::command]
+fn rename_cancel(core: Core<'_>, renamer: Renamer<'_>) -> Result<()> { core.guard()?; renamer.cancel(); Ok(()) }
+#[tauri::command]
+async fn rename_latest(core: Core<'_>, renamer: Renamer<'_>) -> Result<Option<RenamePlan>> {
+    core.guard()?; let service = renamer.inner().clone(); let root = core.root.clone();
+    tauri::async_runtime::spawn_blocking(move || service.latest(&root)).await.map_err(join_error)?
+}
+#[tauri::command]
+async fn rename_undo(core: Core<'_>, renamer: Renamer<'_>, run_id: String) -> Result<RenamePlan> {
+    core.guard()?; let service = renamer.inner().clone(); let root = core.root.clone();
+    tauri::async_runtime::spawn_blocking(move || service.undo(&run_id, &root)).await.map_err(join_error)?
+}
+#[tauri::command]
+async fn rename_export(core: Core<'_>, renamer: Renamer<'_>, plan: RenamePlan, path: String) -> Result<String> {
+    core.guard()?; let service = renamer.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || service.export(&plan, std::path::Path::new(&path))).await.map_err(join_error)?
+}
 fn join_error(error: impl std::fmt::Display) -> AppError {
     AppError::new("WORKER", error.to_string())
 }
@@ -331,6 +424,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
             app.manage(Engine::open(&root)?);
+            app.manage(Arc::new(RenameService::default()));
             if let Some(window) = app.get_webview_window("main") {
                 if let Ok(Some(monitor)) = window.current_monitor() {
                     let scale = monitor.scale_factor();
@@ -343,6 +437,10 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            rename_presets, rename_save_preset, rename_load_preset, rename_import_preset,
+            rename_save_config, rename_load_config, rename_save_draft, rename_load_draft,
+            rename_files, rename_scan, rename_sheet_names, rename_page, rename_live, rename_prepare,
+            rename_execute, rename_progress, rename_cancel, rename_latest, rename_undo, rename_export,
             workspace,
             save_draft,
             import_files,

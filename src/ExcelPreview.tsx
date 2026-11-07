@@ -17,9 +17,11 @@ function rowAt(offsets: Float64Array, y: number) {
   while(low<high) { const mid=Math.floor((low+high+1)/2); if(offsets[mid]<=y)low=mid;else high=mid-1; }
   return Math.min(offsets.length-1,low+1);
 }
-export default function ExcelPreview({ sheet, selection, header, onSelect, focusRow }: {
-  sheet: SourceSheet; selection: SheetRange | null; header: SheetRange;
+export default function ExcelPreview({ sheet, selection, header, onSelect, focusRow, loadPage, caption }: {
+  sheet: SourceSheet; selection: SheetRange | null; header: SheetRange | null;
   onSelect: (range: SheetRange, cell: Cell | null) => void; focusRow?: number;
+  loadPage?: (offset: number, limit: number) => Promise<[DataPage, SheetAppearance]>;
+  caption?: string;
 }) {
   const viewport = useRef<HTMLDivElement>(null);
   const [scroll,setScroll] = useState({ top: 0,left: 0,height: 400 });
@@ -62,7 +64,7 @@ export default function ExcelPreview({ sheet, selection, header, onSelect, focus
     for (const block of blocks) {
       if (requests.current.has(block) || pages[block]) continue;
       requests.current.add(block);
-      Promise.all([call<DataPage>("preview_sheet",{ sheetId: sheet.id,offset: block*100,limit: 100,headerRow: null }),call<SheetAppearance>("preview_appearance",{ sheetId: sheet.id,offset: block*100,limit: 100 })])
+      (loadPage ? loadPage(block*100,100) : Promise.all([call<DataPage>("preview_sheet",{ sheetId: sheet.id,offset: block*100,limit: 100,headerRow: null }),call<SheetAppearance>("preview_appearance",{ sheetId: sheet.id,offset: block*100,limit: 100 })]))
         .then(([page,look]) => {
           if (!alive.current) return;
           requests.current.delete(block);
@@ -151,11 +153,11 @@ export default function ExcelPreview({ sheet, selection, header, onSelect, focus
             alignItems:s?.verticalAlign==="top"?"flex-start":s?.verticalAlign==="center"?"center":"flex-end",textDecoration:[s?.underline?"underline":"",s?.strike?"line-through":""].filter(Boolean).join(" "),paddingLeft:s?.indent?`${s.indent*3+0.3}em`:undefined };
           const value=excelText(cell,s?.numberFormat,numbers.get(`${row}:${col}`),appearance?.date1904);
           const rotation=s?.rotation===255?0:s?.rotation && s.rotation>90?90-s.rotation:s?.rotation??0;
-          return <div key={`${row}:${col}`} id={`excel-${coordinate(row,col)}`} data-cell={coordinate(row,col)} data-row={row} data-column={col} className={`excel-cell ${selected?"selected":""} ${intersects(r,header)?"header-range":""}`} role="gridcell" aria-selected={selected} aria-rowindex={row} aria-colindex={col} aria-rowspan={r.endRow-row+1} aria-colspan={r.endColumn-col+1} aria-label={`${coordinate(row,col)} ${value}`} title={`${coordinate(row,col)} ${value}`} style={css}><span style={{width:"100%",transform:rotation?`rotate(${-rotation}deg)`:undefined,writingMode:s?.rotation===255?"vertical-rl":undefined,textOrientation:s?.rotation===255?"upright":undefined}}>{value}</span></div>;
+          return <div key={`${row}:${col}`} id={`excel-${coordinate(row,col)}`} data-cell={coordinate(row,col)} data-row={row} data-column={col} className={`excel-cell ${selected?"selected":""} ${header && intersects(r,header)?"header-range":""}`} role="gridcell" aria-selected={selected} aria-rowindex={row} aria-colindex={col} aria-rowspan={r.endRow-row+1} aria-colspan={r.endColumn-col+1} aria-label={`${coordinate(row,col)} ${value}`} title={`${coordinate(row,col)} ${value}`} style={css}><span style={{width:"100%",transform:rotation?`rotate(${-rotation}deg)`:undefined,writingMode:s?.rotation===255?"vertical-rl":undefined,textOrientation:s?.rotation===255?"upright":undefined}}>{value}</span></div>;
         })}</div>)}
-        <div className="excel-row-heads" style={{ height: rowOffsets[sheet.rows] }}>{visibleRows.filter((row) => rowOffsets[row]>rowOffsets[row-1]).map((row) => <button type="button" tabIndex={-1} key={row} data-row-pick="true" data-row={row} aria-label={`选择第 ${row} 行`} className={row>=header.startRow && row<=header.endRow?"is-header":""} style={{ top: HEAD+rowOffsets[row-1],height:rowOffsets[row]-rowOffsets[row-1] }} onClick={(e) => { if(e.detail===0) select(row,1,e.shiftKey,true); }}>{row}</button>)}</div>
+        <div className="excel-row-heads" style={{ height: rowOffsets[sheet.rows] }}>{visibleRows.filter((row) => rowOffsets[row]>rowOffsets[row-1]).map((row) => <button type="button" tabIndex={-1} key={row} data-row-pick="true" data-row={row} aria-label={`选择第 ${row} 行`} className={header && row>=header.startRow && row<=header.endRow?"is-header":""} style={{ top: HEAD+rowOffsets[row-1],height:rowOffsets[row]-rowOffsets[row-1] }} onClick={(e) => { if(e.detail===0) select(row,1,e.shiftKey,true); }}>{row}</button>)}</div>
       </div>
     </div>
-    <div className="excel-caption">{appearance?.note ?? "蓝色标记为已设置的表头 · 点击行号可选整行，拖动或 Shift + 点击可框选多行"}{!pages[blocks[0]] && <span role="status"> · 正在读取…</span>}</div>
+    <div className="excel-caption">{appearance?.note ?? caption ?? "蓝色标记为已设置的表头 · 点击行号可选整行，拖动或 Shift + 点击可框选多行"}{!pages[blocks[0]] && <span role="status"> · 正在读取…</span>}</div>
   </div>;
 }

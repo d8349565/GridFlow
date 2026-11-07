@@ -496,6 +496,8 @@ pub fn id() -> String {
 }
 
 pub fn generate_types(path: &std::path::Path) -> std::io::Result<()> {
+    use crate::rename::*;
+    use crate::rename_config::{RenamePreset, RenamePresetSummary};
     use std::fmt::Write;
     let mut text = String::from("// Generated from Rust DTOs. Run npm run types; do not edit.\n");
     macro_rules! decl { ($($t:ty),*)=>{$(writeln!(text,"export {}",<$t as TS>::decl()).unwrap();)*}; }
@@ -536,7 +538,10 @@ pub fn generate_types(path: &std::path::Path) -> std::io::Result<()> {
         DataPage,
         PivotSpec,
         Analysis,
-        AppError
+        AppError,
+        RenameCell, RenameArea, RenameCondition, RenameLookupEntry, RenamePart,
+        RenameSum, RenameCheck, RenameRules, RenameFile, RenameScan, RenamePage,
+        RenameRow, RenamePlan, RenameProgress, RenamePreset, RenamePresetSummary, RenameOutput, RenameOutputMode
     );
     std::fs::create_dir_all(path.parent().unwrap())?;
     std::fs::write(path, text)

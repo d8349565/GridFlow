@@ -66,6 +66,7 @@ import LookupColumns from "./LookupColumns";
 import OutputManager from "./OutputManager";
 import ConfigCheck from "./ConfigCheck";
 import FixedInfoColumns from "./FixedInfoColumns";
+import RenameWorkbench, { type RenameSession } from "./RenameWorkbench";
 import { activeOutputs, applyFirstFileSettings, editConfiguration, executionRules, fileEnabled, mergeMode, removeOutputColumn, syncGroups, syncOutputSources, outputError, templateFile, templateProblems } from "./summary";
 import OnboardingTour from "./OnboardingTour";
 import HelpModal from "./HelpModal";
@@ -163,6 +164,11 @@ function rulesReducer(
   };
 }
 export default function App() {
+  const [tool, setTool] = useState<"summary" | "rename">("summary");
+  const toolRef = useRef(tool); toolRef.current = tool;
+  const renameBusy = useRef(false);
+  const renameFlush = useRef<(() => Promise<void>) | null>(null);
+  const renameSession = useRef<RenameSession | null>(null);
   const [ws, setWs] = useState<Workspace | null>(null);
   const [rulesState, dispatch] = useReducer(rulesReducer, {
     current: defaultRules(),
@@ -330,6 +336,17 @@ export default function App() {
     window
       .onCloseRequested(async (event) => {
         event.preventDefault();
+        if (renameBusy.current) {
+          globalThis.dispatchEvent(new Event("gridflow-rename-close-blocked"));
+          return;
+        }
+        if (toolRef.current === "rename") {
+          try { await renameFlush.current?.(); }
+          catch (error) {
+            globalThis.dispatchEvent(new CustomEvent("gridflow-rename-save-failed",{detail:error}));
+            return;
+          }
+        }
         try {
           if (ready.current && !latestLocked.current)
             await call("save_draft", {
@@ -634,7 +651,7 @@ export default function App() {
     let disposed = false;
     getCurrentWebviewWindow()
       .onDragDropEvent((event) => {
-        if (event.payload.type === "drop")
+        if (event.payload.type === "drop" && toolRef.current === "summary")
           void importPaths(event.payload.paths);
       })
       .then((unlisten) => {
@@ -648,6 +665,7 @@ export default function App() {
   }, []);
   useEffect(() => {
     function key(event: KeyboardEvent) {
+      if (toolRef.current !== "summary") return;
       const target = event.target as HTMLElement;
       const editing = target.matches("input,textarea,[contenteditable=true]");
       if (event.ctrlKey && event.key === "o") {
@@ -1209,6 +1227,7 @@ export default function App() {
         </div>
       </div>
     );
+  if (tool === "rename") return <RenameWorkbench onBack={() => setTool("summary")} onBusy={(busy) => { renameBusy.current = busy; }} session={renameSession.current} onSessionChange={(next) => { renameSession.current = next; }} onFlush={(flush) => { renameFlush.current=flush; }} />;
   return (
     <div className="app-shell">
       <header className="app-header">
@@ -1227,6 +1246,7 @@ export default function App() {
           </div>
           <strong>汇格 · GridFlow</strong>
         </div>
+        <nav className="module-nav" aria-label="工具入口"><button className="active" aria-current="page">Excel 汇总</button><button disabled={!!busy || !!running || !ws} onClick={() => { setTourActive(false); setModal(null); setTool("rename"); }}>批量重命名</button></nav>
         {!!(ws?.files.length || ws?.datasets.length) && <nav className="stage-nav" aria-label="汇总步骤">
           <button className={phase === "configure" && !isHome ? "active" : ""} aria-current={phase === "configure" && !isHome ? "step" : undefined} aria-label={phase === "results" ? "返回修改配置" : undefined} title="配置表头、输出列与整理方式" onClick={returnToConfig}><span aria-hidden="true">1</span>配置汇总内容</button>
           <button className={phase === "results" && !isHome ? "active" : ""} aria-current={phase === "results" && !isHome ? "step" : undefined} disabled={!ws?.datasets.length && !running} onClick={() => { setHomeView(false); setPhase("results");setTab("result"); }}><span aria-hidden="true">2</span>预览与保存</button>
