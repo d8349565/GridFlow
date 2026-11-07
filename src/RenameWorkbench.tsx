@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
-import { ArrowLeft, Check, Download, FilePenLine, FileSpreadsheet, FolderOpen, History, Plus, RotateCcw, Save, Square, Trash2, X } from "lucide-react";
+import { ArrowLeft, ArrowRight, Check, Download, FilePenLine, FileSpreadsheet, FolderOpen, History, Plus, RotateCcw, Save, Square, Trash2, X } from "lucide-react";
 import { Button, Modal } from "./components";
 import ExcelPreview, { rangeLabel } from "./ExcelPreview";
 import { call, cellText, coordinate, isTauri, savePath } from "./api";
@@ -56,6 +56,11 @@ export default function RenameWorkbench({ onBack, onBusy, session, onSessionChan
   const [sheetNames, setSheetNames] = useState<string[]>([]);
   const [sheetName, setSheetName] = useState("");
   const [firstPage, setFirstPage] = useState<RenamePage | null>(null);
+  const [columnOffset,setColumnOffset] = useState(0);
+  const [gotoAddress,setGotoAddress] = useState("");
+  const [previewFocusRow,setPreviewFocusRow] = useState(1);
+  const [previewFocusColumn,setPreviewFocusColumn] = useState(1);
+  const [positionKey,setPositionKey] = useState(0);
   const [sheetError, setSheetError] = useState("");
   const [selection, setSelection] = useState<SheetRange | null>(null);
   const [value, setValue] = useState<Cell | null>(null);
@@ -102,7 +107,7 @@ export default function RenameWorkbench({ onBack, onBusy, session, onSessionChan
   const concentrated = plan?.output.mode !== undefined && plan.output.mode !== "original";
   const rows = plan?.rows.filter(r => !onlyProblems || hasProblem(r)) ?? [];
   const incompleteCheck = rules.checks.some(check => !check.sums.length);
-  const validSelection = !!selection && firstPage?.sheet.fileId === activeId && firstPage.sheet.name === sheetName;
+  const validSelection = !!selection && firstPage?.sheet.fileId === activeId && firstPage.sheet.name === sheetName && firstPage.columnOffset === columnOffset;
   const canConfirmPick = validSelection && (pick?.kind === "sum" || (!!source && value !== null));
   const pickInstruction = pick?.kind === "tag" ? "请点选决定是否显示标签的单元格。" : pick?.kind === "expected" ? "请点选填写总金额或总数量的单元格。" : pick?.kind === "sumCondition" ? "请点选决定是否计入此区域的单元格。" : "请框选合计区域；选择单个单元格时，将从该行合计到表尾。";
   const pickConfirmText = pick?.kind === "tag" ? "确认条件单元格" : pick?.kind === "expected" ? "确认填写值" : pick?.kind === "sumCondition" ? "使用此条件" : "使用此合计区域";
@@ -181,20 +186,21 @@ export default function RenameWorkbench({ onBack, onBusy, session, onSessionChan
   }, [busy]);
   useEffect(() => {
     if (!activeId) return;
-    let disposed = false; setSheetNames([]); setSheetName(""); setFirstPage(null); setSheetError(""); setSelection(null); setValue(null);
+    let disposed = false; setColumnOffset(0); setPreviewFocusRow(1); setSheetNames([]); setSheetName(""); setFirstPage(null); setSheetError(""); setSelection(null); setValue(null);
     call<string[]>("rename_sheet_names", { fileId: activeId }).then(names => { if (!disposed) { setSheetNames(names); setSheetName(old => names.includes(old) ? old : names[0] ?? ""); } }).catch(e => { if (!disposed) setSheetError(errorText(e)); });
     return () => { disposed = true; };
   }, [activeId, epoch]);
   useEffect(() => {
     if (!activeId || !sheetName) return;
-    let disposed = false; setFirstPage(null); setSelection(null); setValue(null); setSheetError("");
-    call<RenamePage>("rename_page", { fileId: activeId, sheet: sheetName, offset: 0, limit: 100 }).then(p => { if (!disposed) setFirstPage(p); }).catch(e => { if (!disposed) setSheetError(errorText(e)); });
+    let disposed = false; setFirstPage(null); setValue(null); setSheetError("");
+    call<RenamePage>("rename_page", { fileId: activeId, sheet: sheetName, offset: 0, limit: 100, columnOffset }).then(p => { if (!disposed) setFirstPage(p); }).catch(e => { if (!disposed) setSheetError(errorText(e)); });
     return () => { disposed = true; };
-  }, [activeId, sheetName, epoch]);
+  }, [activeId, sheetName, epoch, columnOffset]);
   const loadPage = useCallback(async (offset: number, limit: number): Promise<[DataPage, SheetAppearance]> => {
-    const p = offset === 0 && firstPage ? firstPage : await call<RenamePage>("rename_page", { fileId: activeId, sheet: sheetName, offset, limit });
+    const p = offset === 0 && firstPage?.columnOffset === columnOffset ? firstPage : await call<RenamePage>("rename_page", { fileId: activeId, sheet: sheetName, offset, limit, columnOffset });
     return [p.page, p.appearance];
-  }, [activeId, sheetName, firstPage]);
+  }, [activeId, sheetName, firstPage, columnOffset]);
+  useEffect(() => { if (positionKey) sheetPreview.current?.querySelector<HTMLElement>(".excel-scroll")?.focus(); },[positionKey,firstPage]);
   useEffect(() => {
     setLive(null); setLiveError("");
     if (!activeId || !rules.parts.length || busy || !draftReady || incompleteCheck || view !== "configure") { setLivePending(false); return; }
@@ -249,6 +255,18 @@ export default function RenameWorkbench({ onBack, onBusy, session, onSessionChan
     }
     setPick(null);
   }
+  function changeColumns(next: number) {
+    const target=Math.max(0,Math.min(16320,next));setColumnOffset(target);setPreviewFocusColumn(target+1); setPreviewFocusRow(selection?.startRow ?? 1); setValue(null);
+    if (pick?.kind !== "sum") setSelection(null);
+    setPositionKey(v => v + 1);
+  }
+  function locateCell() {
+    const match=/^([A-Z]{1,3})([1-9]\d{0,6})$/.exec(gotoAddress.trim().replace(/\$/g,"").toUpperCase());
+    const column=match ? [...match[1]].reduce((n,c) => n*26+c.charCodeAt(0)-64,0) : 0, row=match ? Number(match[2]) : 0;
+    if (!column || column>16384 || !row || row>1048576) {notify("warning","请输入有效的单元格地址","例如 K35，支持 A1 至 XFD1048576。");return;}
+    setColumnOffset(Math.floor((column-1)/80)*80);setPreviewFocusRow(row);setPreviewFocusColumn(column);setPositionKey(v => v+1);setValue(null);
+    setSelection({startRow:row,endRow:row,startColumn:column,endColumn:column});
+  }
   async function chooseConfiguration() { await run("选择配置",async () => {
     const path=await open({multiple:false,filters:[{name:"汇格加密命名配置",extensions:["gfrcfg"]}]});
     if (typeof path === "string") setConfiguration({mode:"load",path});
@@ -278,9 +296,10 @@ export default function RenameWorkbench({ onBack, onBusy, session, onSessionChan
         <section className="rename-output" aria-label="文件输出位置"><h3>文件存放位置</h3><label className="rename-field"><select aria-label="文件存放方式" disabled={!!busy} value={output.mode === "original" ? "original" : "collect"} onChange={e => changeOutput({...output,mode:e.target.value === "original" ? "original" : "copy"})}><option value="original">在原文件夹改名</option><option value="collect">集中到一个文件夹</option></select></label>
           {output.mode !== "original" ? <><Button icon={FolderOpen} className="rename-output-folder" disabled={!!busy} title={output.directory ? displayPath(output.directory) : "选择所有文件集中保存的位置"} onClick={() => void chooseOutput()}>{output.directory ? <span>{fileName(output.directory)}</span> : "选择目标文件夹"}</Button>{output.directory && <small className="rename-output-path" title={displayPath(output.directory)}>{displayPath(output.directory)}</small>}<label className="check-label"><input type="checkbox" disabled={!!busy} checked={output.mode === "copy"} onChange={e => changeOutput({...output,mode:e.target.checked ? "copy" : "move"})} />保留原文件（复制）</label><label className="check-label"><input type="checkbox" disabled={!!busy} checked={output.numberConflicts} onChange={e => changeOutput({...output,numberConflicts:e.target.checked})} />重名时自动编号</label><small>{output.mode === "copy" ? "重命名后复制到目标文件夹。" : "重命名后移到目标文件夹，原位置不再保留。"}执行前可核对完整路径。</small></> : <small>在各自所在的文件夹中重命名。</small>}
         </section>
-      </aside>} source={<main className="rename-source"><div className="pane-toolbar"><strong title={activeFile?.path}>{activeFile?.name ?? "从原表中选择命名内容"}</strong>{sheetNames.length > 0 && <select aria-label="重命名取值工作表" disabled={!!busy} value={sheetName} onChange={e => setSheetName(e.target.value)}>{sheetNames.map(s => <option key={s}>{s}</option>)}</select>}</div>
+      </aside>} source={<main className="rename-source"><div className="pane-toolbar"><strong title={activeFile?.path}>{activeFile?.name ?? "从原表中选择命名内容"}</strong>{sheetNames.length > 0 && <select aria-label="重命名取值工作表" disabled={!!busy} value={sheetName} onChange={e => { setColumnOffset(0); setPreviewFocusRow(1); setSelection(null); setSheetName(e.target.value); }}>{sheetNames.map(s => <option key={s}>{s}</option>)}</select>}</div>
+        {sheetName && <div className="rename-preview-window" aria-label="原表预览范围"><div><Button className="quiet icon-button" icon={ArrowLeft} aria-label="上一组列" title="上一组列" disabled={!!busy || !columnOffset || !firstPage} onClick={() => changeColumns(columnOffset - 80)} /><span>列 {coordinate(1,columnOffset+1).slice(0,-1)}–{coordinate(1,columnOffset+(firstPage?.sheet.width ?? 80)).slice(0,-1)}</span><Button className="quiet icon-button" icon={ArrowRight} aria-label="下一组列" title="下一组列" disabled={!!busy || !firstPage || columnOffset+firstPage.sheet.width >= firstPage.totalColumns} onClick={() => changeColumns(columnOffset + 80)} /></div><form onSubmit={e => {e.preventDefault();locateCell();}}><input aria-label="定位单元格地址" placeholder="如 K35" maxLength={14} value={gotoAddress} disabled={!!busy} onChange={e => setGotoAddress(e.target.value)} /><Button type="submit" disabled={!!busy || !gotoAddress.trim()}>定位单元格</Button></form></div>}
         {pick ? <div className="rename-pick-banner" role="status"><div className="rename-pick-description"><strong>{pickInstruction}</strong><span>{validSelection && selection ? `${sheetName}!${rangeLabel(selection)}${source ? ` · ${cellText(value ?? undefined) || "空白"}` : ""}` : "尚未选择，支持切换工作表；按 Esc 可取消。"}</span></div><Button primary disabled={!!busy || !canConfirmPick} onClick={confirmPick}>{pickConfirmText}</Button><Button icon={X} aria-label="取消选取" onClick={() => setPick(null)} /></div> : <div className="rename-selection-actions"><span>{source ? `${label(source)} · ${cellText(value ?? undefined) || "空白"}` : "先选内容再加入文件名；条件和校验先点功能再选。"}</span><Button disabled={!!busy || !draftReady || !source} icon={Plus} primary onClick={() => source && addPart({ kind: "cell", source, decimals: null })}>加入文件名</Button><Button disabled={!!busy || !draftReady || !source} onClick={() => setLookupSource(source)}>添加对照</Button><Button disabled={!!busy || !draftReady || !firstPage} onClick={() => startPick({kind:"tag"})}>条件标签</Button><Button disabled={!!busy || !draftReady || !firstPage} onClick={() => startPick({kind:"expected"})}>添加校验</Button></div>}
-        <div ref={sheetPreview} className={`rename-sheet ${pick ? "is-picking" : ""}`}>{sheetError ? <div className="empty-state"><p role="alert">{sheetError}</p><Button onClick={() => setEpoch(v => v + 1)}>重新读取</Button></div> : firstPage ? <ExcelPreview key={`${activeId}:${sheetName}:${epoch}`} sheet={firstPage.sheet} selection={selection} header={null} onSelect={(r, c) => { setSelection(r); setValue(c); }} loadPage={loadPage} caption="点选单元格命名 · 合并单元格取左上角 · 公式使用 Excel 已保存的结果" /> : <div className="empty-state">{activeId ? "正在读取工作表…" : <><FilePenLine size={36} /><h2>点选内容，批量生成文件名</h2><p>添加文件 → 点选单元格 → 核对并执行。<br />编码对照、金额/数量校验和条件标签按需添加。</p></>}</div>}</div>
+        <div ref={sheetPreview} className={`rename-sheet ${pick ? "is-picking" : ""}`}>{sheetError ? <div className="empty-state"><p role="alert">{sheetError}</p><Button onClick={() => setEpoch(v => v + 1)}>重新读取</Button></div> : firstPage && firstPage.columnOffset === columnOffset ? <ExcelPreview key={`${activeId}:${sheetName}:${epoch}:${columnOffset}:${positionKey}`} sheet={{...firstPage.sheet,rows:Math.max(firstPage.sheet.rows,previewFocusRow)}} columnOffset={firstPage.columnOffset} focusRow={previewFocusRow} focusColumn={previewFocusColumn} selection={selection} header={null} onSelect={(r, c) => { setSelection(r); setValue(c); }} loadPage={loadPage} caption="点选单元格命名 · 合并单元格取左上角 · 公式使用 Excel 已保存的结果" /> : <div className="empty-state">{activeId ? "正在读取工作表…" : <><FilePenLine size={36} /><h2>点选内容，批量生成文件名</h2><p>添加文件 → 点选单元格 → 核对并执行。<br />编码对照、金额/数量校验和条件标签按需添加。</p></>}</div>}</div>
         <section className="rename-live" aria-label="当前文件实时预览" aria-live="polite"><div><strong>当前文件名预览</strong><small>{livePending ? "正在更新…" : "随规则自动更新；执行前还会核对全部文件"}</small></div><p className={liveError || live?.state === "skipped" ? "rename-invalid" : ""}>{!draftReady ? "正在读取加密草稿…" : incompleteCheck ? "请选择校验的合计区域，完成后更新预览" : livePending ? "正在读取所选内容…" : liveError || live?.newName || (rules.parts.length ? live?.message || "选择文件查看预览" : "在上方点选单元格，加入文件名")}</p>{live && <><small>{stateNames[live.state]}{live.message ? ` · ${live.message}` : ""}</small>{!!live.checks.length && <details><summary>查看 {live.checks.length} 项校验结果</summary>{live.checks.map((c, i) => <p key={i}>{c}</p>)}</details>}</>}</section>
       </main>} rules={<RenameRulesPanel rules={rules} live={live} livePending={livePending} busy={!!busy} picking={!!pick} ready={draftReady} editorRef={editor} onChange={change} onPick={startPick} onReset={() => setConfirm("clear")} />
     } /> : <main className="rename-review"><div className="rename-review-heading"><div><Button className="quiet" icon={ArrowLeft} disabled={!!busy} onClick={() => setView("configure")}>返回命名规则</Button><h1>{plan?.journalPath ? "文件处理记录" : "核对文件名"}</h1><p>{plan?.journalPath ? `已完成 ${processedCount} 个 · 已撤销 ${plan.rows.filter(r => r.state === "restored").length} 个` : `${readyCount} 个可以处理 · ${(plan?.rows.length ?? 0) - readyCount} 个无需处理或已跳过`}</p>{concentrated && <p className="rename-review-destination"><strong>{plan?.output.mode === "copy" ? "复制到" : "移动到"}</strong><span title={displayPath(plan?.output.directory ?? "")}>{displayPath(plan?.output.directory ?? "")}</span></p>}</div><div className="rename-review-actions"><Button icon={Download} disabled={!!busy || !plan} onClick={() => void exportLog()}>保存日志与汇总</Button>{plan?.journalPath ? <Button icon={RotateCcw} disabled={!!busy || !undoCount} onClick={() => setConfirm("undo")}>{plan?.output.mode === "copy" ? "撤销副本" : concentrated ? "恢复原位" : "恢复原名"}（{undoCount}）</Button> : <Button primary icon={FilePenLine} disabled={!!busy || !readyCount} onClick={() => setConfirm("execute")}>{concentrated ? plan?.output.mode === "copy" ? "重命名并复制" : "重命名并移动" : "执行重命名"}（{readyCount}）</Button>}</div></div><div className="rename-review-filter"><label className="check-label"><input type="checkbox" checked={onlyProblems} onChange={e => { setOnlyProblems(e.target.checked); setPageIndex(0); }} />只看需要处理的问题</label><span>共 {rows.length} 项 · 每页 100 项</span></div><div className="rename-table-scroll"><table><thead><tr><th>原文件名</th><th>{concentrated ? "新文件名 / 目标路径" : "新文件名"}</th><th>状态</th><th>说明 / 校验结果</th></tr></thead><tbody>{rows.slice(pageIndex * 100, (pageIndex + 1) * 100).map(row => <tr key={row.id}><td title={displayPath(row.path)}>{row.originalName}<small>{displayPath(row.path)}</small></td><td>{row.newName || "—"}{row.targetPath && <small title={displayPath(row.targetPath)}>{displayPath(row.targetPath)}</small>}</td><td className={problemStates.has(row.state) ? "rename-invalid" : ""}><span className="rename-state" data-state={row.state}>{stateNames[row.state] ?? row.state}</span>{row.hasMismatch && <span className="rename-check-warning">校验不一致</span>}</td><td>{row.message || "—"}{!!row.checks.length && <details><summary>{row.checks.length} 项校验</summary>{row.checks.map((c, i) => <p key={i}>{c}</p>)}</details>}</td></tr>)}</tbody></table>{!rows.length && <div className="empty-state">没有符合条件的记录。</div>}</div><div className="rename-pagination"><Button disabled={!pageIndex} onClick={() => setPageIndex(v => v - 1)}>上一页</Button><span>{rows.length ? pageIndex + 1 : 0} / {Math.ceil(rows.length / 100)}</span><Button disabled={(pageIndex + 1) * 100 >= rows.length} onClick={() => setPageIndex(v => v + 1)}>下一页</Button></div>{plan?.journalPath && <p className="rename-journal" title={plan.journalPath}>恢复记录已保存在本机：{plan.journalPath}</p>}</main>}

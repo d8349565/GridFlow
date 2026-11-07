@@ -10,6 +10,7 @@ import {
 } from "react";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { version as appVersion } from "../package.json";
 import {
   FileSpreadsheet,
   FolderOpen,
@@ -3093,7 +3094,7 @@ export default function App() {
                 <div className="about-info-card">
                   <div className="about-info-row">
                     <span className="about-info-label">当前版本</span>
-                    <span className="about-info-value">v2.0.0</span>
+                    <span className="about-info-value">v{appVersion}</span>
                   </div>
                   <div className="about-info-row">
                     <span className="about-info-label">项目地址</span>

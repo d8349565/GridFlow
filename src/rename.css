@@ -48,6 +48,12 @@
 .rename-source .pane-toolbar { flex-shrink: 0; justify-content: space-between; gap: 12px; }
 .rename-source .pane-toolbar strong { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .rename-source .pane-toolbar select { max-width: 45%; }
+.rename-preview-window { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 6px 10px; padding: 7px 12px; border-bottom: 1px solid var(--border); background: #fafbfd; flex-shrink: 0; }
+.rename-preview-window > div, .rename-preview-window > form { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.rename-preview-window > div > span { color: #46566d; font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.rename-preview-window input { width: 90px; min-width: 60px; }
+.rename-preview-window .button { min-height: 28px; padding: 5px 8px; }
+.rename-preview-window .icon-button { width: 26px; min-width: 26px; padding: 4px; }
 .rename-selection-actions { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; padding: 10px 14px; border-bottom: 1px solid var(--border); }
 .rename-selection-actions > span { width: 100%; color: var(--muted); white-space: normal; overflow-wrap: anywhere; line-height: 1.5; min-height: 18px; max-height: 40px; overflow: hidden; }
 .rename-shell .excel-fx, .rename-shell .excel-address { flex-shrink: 0; white-space: nowrap; }

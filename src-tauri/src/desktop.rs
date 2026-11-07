@@ -58,9 +58,9 @@ async fn rename_sheet_names(core: Core<'_>, renamer: Renamer<'_>, file_id: Strin
     tauri::async_runtime::spawn_blocking(move || service.sheet_names(&file_id)).await.map_err(join_error)?
 }
 #[tauri::command]
-async fn rename_page(core: Core<'_>, renamer: Renamer<'_>, file_id: String, sheet: String, offset: usize, limit: usize) -> Result<RenamePage> {
+async fn rename_page(core: Core<'_>, renamer: Renamer<'_>, file_id: String, sheet: String, offset: usize, limit: usize, column_offset: Option<usize>) -> Result<RenamePage> {
     core.guard()?; let service = renamer.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || service.page(&file_id, &sheet, offset, limit)).await.map_err(join_error)?
+    tauri::async_runtime::spawn_blocking(move || service.page_window(&file_id, &sheet, offset, limit,column_offset.unwrap_or(0))).await.map_err(join_error)?
 }
 #[tauri::command]
 async fn rename_live(core: Core<'_>, renamer: Renamer<'_>, file_id: String, rules: RenameRules) -> Result<RenameRow> {

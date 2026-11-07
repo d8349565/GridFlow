@@ -2,7 +2,7 @@
 export type Cell = { "kind": "empty" } | { "kind": "text", "value": string } | { "kind": "number", "value": number } | { "kind": "bool", "value": boolean } | { "kind": "date", "value": string };
 export type ColumnType = "auto" | "text" | "number" | "date" | "skip";
 export type Column = { key: string, name: string, dataType: ColumnType, suggestedType: ColumnType, };
-export type SourceSheet = { id: string, fileId: string, name: string, rows: number, width: number, suggestedHeaderRow: number, columns: Array<Column>, };
+export type SourceSheet = { id: string, fileId: string, name: string, rows: number, width: number, suggestedHeaderRow: number, columns: Array<Column>, readNote?: string, };
 export type SourceFile = { id: string, name: string, size: number, importedAt: string, storedPath: string, encoding: string | null, sheets: Array<SourceSheet>, };
 export type SourceSelection = { sheetId: string, enabled: boolean, headerRow: number, sourceName: string, headerRange?: SheetRange, };
 export type FileSelection = { fileId: string, enabled: boolean, };
@@ -46,7 +46,7 @@ export type RenameCheck = { label: string, expected: RenameCell, sums: Array<Ren
 export type RenameRules = { parts: Array<RenamePart>, separator: string, prefix: string, suffix: string, checks: Array<RenameCheck>, };
 export type RenameFile = { id: string, path: string, name: string, };
 export type RenameScan = { files: Array<RenameFile>, warnings: Array<string>, };
-export type RenamePage = { sheet: SourceSheet, page: DataPage, appearance: SheetAppearance, };
+export type RenamePage = { sheet: SourceSheet, page: DataPage, appearance: SheetAppearance, columnOffset: number, totalColumns: number, };
 export type RenameRow = { id: string, path: string, originalName: string, newName: string, values: Array<string>, checks: Array<string>, state: string, message: string, hasMismatch: boolean, targetPath: string | null, };
 export type RenamePlan = { id: string, rows: Array<RenameRow>, journalPath: string | null, valueLabels: Array<string>, output: RenameOutput, };
 export type RenameProgress = { busy: boolean, phase: string, done: number, total: number, current: string, };

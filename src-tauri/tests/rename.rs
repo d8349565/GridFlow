@@ -22,6 +22,122 @@ fn fixture(path: &Path, code: &str) {
 fn rules() -> RenameRules {
     RenameRules { parts:vec![RenamePart::Cell { source:cell("说明",1,1),decimals:None }],separator:"_".into(),prefix:String::new(),suffix:String::new(),checks:vec![] }
 }
+
+#[test]
+fn rename_reads_only_configured_cells_and_check_areas() {
+    let temp=isolated();let path=temp.path().join("无关超宽列.xlsx");let mut book=Workbook::new();let sheet=book.add_worksheet();sheet.set_name("说明").unwrap();
+    sheet.write_string(0,0,"001").unwrap();sheet.write_number(1,0,30.).unwrap();sheet.write_number(2,0,10.).unwrap();sheet.write_number(3,0,20.).unwrap();
+    sheet.write_string(3,4095,"新增列头").unwrap();sheet.write_number(99,4095,999.).unwrap();sheet.write_formula(0,16383,rust_xlsxwriter::Formula::new("=1+1").set_result("2")).unwrap();book.save(&path).unwrap();let original=fs::read(&path).unwrap();
+    let service=RenameService::default();let file=service.scan(vec![path.to_string_lossy().into()],false).unwrap().files.remove(0);let mut r=rules();r.checks.push(RenameCheck {label:"金额异常".into(),expected:cell("说明",2,1),sums:vec![RenameSum {area:RenameArea {sheet:"说明".into(),range:SheetRange {start_row:3,end_row:4,start_column:1,end_column:1}},divisor:1.,min_filled:0,condition:None}],tolerance_percent:0.});
+    let live=service.live(&file.id,&r).unwrap();assert_eq!(live.state,"ready","unrelated cells must not block renaming: {}",live.message);assert_eq!(live.new_name,"001.xlsx");assert!(live.checks[0].contains("通过"));
+    let mut far=r.clone();far.parts.push(RenamePart::Cell {source:cell("说明",1,16384),decimals:None});assert_eq!(service.live(&file.id,&far).unwrap().new_name,"001_2.xlsx");
+    let plan=service.prepare(vec![file.id.clone()],r).unwrap();assert_eq!(plan.rows[0].state,"ready");
+    let page=service.page_window(&file.id,"说明",0,100,16320).unwrap();assert_eq!(page.column_offset,16320);assert_eq!(page.sheet.width,64);assert_eq!(page.page.rows[0][63],excel_workbench::model::Cell::Number(2.));assert_eq!(fs::read(&path).unwrap(),original);
+}
+
+#[test]
+fn trailing_blank_columns_do_not_skip_rename_or_summary() {
+    let temp=isolated();let path=temp.path().join("误扩空列.xlsx");
+    let mut book=Workbook::new();let sheet=book.add_worksheet();sheet.set_name("说明").unwrap();
+    sheet.write_string(0,0,"001").unwrap();sheet.write_number(4,4,123.45).unwrap();
+    sheet.write_blank(8,16383,&rust_xlsxwriter::Format::new().set_background_color("#EEEEEE")).unwrap();
+    sheet.write_string(1_048_575,16383,"   \t").unwrap();book.save(&path).unwrap();
+    let original=fs::read(&path).unwrap();
+    let service=RenameService::default();let file=service.scan(vec![path.to_string_lossy().into()],false).unwrap().files.remove(0);
+    let row=service.live(&file.id,&rules()).unwrap();assert_eq!(row.state,"ready","blank tail must not skip the file: {}",row.message);assert_eq!(row.new_name,"001.xlsx");
+    let page=service.page(&file.id,"说明",0,100).unwrap();assert_eq!((page.sheet.rows,page.sheet.width),(1_048_576,80));assert_eq!(page.page.rows.len(),100);assert_eq!(page.page.rows[4][4],excel_workbench::model::Cell::Number(123.45));
+    let imported=excel_workbench::reader::read(&path).unwrap();assert_eq!((imported.sheets[0].rows.len(),imported.sheets[0].width),(5,5));
+    assert_eq!(fs::read(&path).unwrap(),original,"reading must not modify the original workbook");
+}
+
+#[test]
+fn expanded_excel_table_headers_without_column_data_do_not_block_reading() {
+    let temp=isolated();let path=temp.path().join("超级表误扩列.xlsx");let mut book=Workbook::new();let sheet=book.add_worksheet();sheet.set_name("说明").unwrap();
+    sheet.write_string(1,0,"001").unwrap();sheet.write_string(1,1,"填报人").unwrap();sheet.write_number(1,2,10.).unwrap();sheet.write_number(4,2,20.).unwrap();
+    sheet.add_table(0,0,5,4095,&rust_xlsxwriter::Table::new()).unwrap();book.save(&path).unwrap();let original=fs::read(&path).unwrap();
+    let service=RenameService::default();let file=service.scan(vec![path.to_string_lossy().into()],false).unwrap().files.remove(0);let mut r=rules();r.parts[0]=RenamePart::Cell {source:cell("说明",2,1),decimals:None};
+    let live=service.live(&file.id,&r).unwrap();assert_eq!(live.state,"ready","table-generated headers without body data should not block reading: {}",live.message);assert_eq!(live.new_name,"001.xlsx");
+    let page=service.page(&file.id,"说明",0,100).unwrap();assert_eq!(page.sheet.width,80);assert!(page.appearance.note.as_ref().is_some_and(|n|n.contains("按行加载")),"preview should disclose its bounded window");
+    let imported=excel_workbench::reader::read(&path).unwrap();assert_eq!(imported.sheets[0].width,3);assert_eq!(fs::read(&path).unwrap(),original);
+    let core=excel_workbench::engine::Engine::open(&temp.path().join("data")).unwrap();let imported=core.import_files(vec![path.to_string_lossy().into()]).unwrap();assert!(imported[0].error.is_none());let source=&imported[0].file.as_ref().unwrap().sheets[0];
+    assert_eq!(source.width,3);assert!(core.preview_appearance(&source.id,0,100).unwrap().note.as_ref().is_some_and(|n|n.contains("4093")));
+}
+
+#[test]
+fn table_cropping_preserves_real_tail_values_and_regular_headers() {
+    let temp=isolated();
+    for kind in ["number","false","formula","text"] {
+        let path=temp.path().join(format!("真实尾列-{kind}.xlsx"));let mut book=Workbook::new();let sheet=book.add_worksheet();sheet.set_name("说明").unwrap();sheet.write_string(1,0,"001").unwrap();sheet.add_table(0,0,5,4095,&rust_xlsxwriter::Table::new()).unwrap();
+        match kind {"number"=>{sheet.write_number(2,4095,0.).unwrap();},"false"=>{sheet.write_boolean(2,4095,false).unwrap();},"formula"=>{sheet.write_formula(2,4095,rust_xlsxwriter::Formula::new("IF(1=1,\"\",\"\")").set_result("")).unwrap();},_=>{sheet.write_string(2,4095,"有内容").unwrap();}}
+        book.save(&path).unwrap();assert_eq!(excel_workbench::reader::read(&path).err().unwrap().code,"LIMIT","{kind} must not be cropped");
+    }
+    let path=temp.path().join("普通表头.xlsx");let mut book=Workbook::new();let sheet=book.add_worksheet();sheet.write_string(0,4095,"普通文本").unwrap();sheet.write_string(1,0,"001").unwrap();book.save(&path).unwrap();assert_eq!(excel_workbench::reader::read(&path).err().unwrap().code,"LIMIT","ordinary text is not presumed to be a generated table header");
+    let path=temp.path().join("正常小表.xlsx");let mut book=Workbook::new();let sheet=book.add_worksheet();sheet.write_string(1,0,"001").unwrap();sheet.add_table(0,0,5,5,&rust_xlsxwriter::Table::new()).unwrap();book.save(&path).unwrap();let imported=excel_workbench::reader::read(&path).unwrap();assert_eq!(imported.sheets[0].width,6);assert!(imported.sheets[0].note.is_none());
+}
+
+#[test]
+fn offset_and_empty_oversized_tables_keep_original_coordinates() {
+    let temp=isolated();let path=temp.path().join("偏移超级表.xlsx");let mut book=Workbook::new();let sheet=book.add_worksheet();sheet.set_name("说明").unwrap();
+    sheet.write_string(0,0,"表外说明").unwrap();sheet.write_string(5,2,"001").unwrap();sheet.write_number(6,4,1.).unwrap();sheet.add_table(4,2,10,4095,&rust_xlsxwriter::Table::new()).unwrap();book.save(&path).unwrap();
+    let imported=excel_workbench::reader::read(&path).unwrap();assert_eq!((imported.sheets[0].rows.len(),imported.sheets[0].width),(7,5));assert_eq!(imported.sheets[0].rows[5][2],excel_workbench::model::Cell::Text("001".into()));assert!(matches!(imported.sheets[0].rows[0][2],excel_workbench::model::Cell::Empty));
+    let path=temp.path().join("只有表头.xlsx");let mut book=Workbook::new();let sheet=book.add_worksheet();sheet.add_table(0,0,1,4095,&rust_xlsxwriter::Table::new()).unwrap();book.save(&path).unwrap();let imported=excel_workbench::reader::read(&path).unwrap();assert_eq!((imported.sheets[0].rows.len(),imported.sheets[0].width),(1,1));assert!(imported.sheets[0].note.is_some());
+}
+
+#[test]
+fn absolute_and_parent_relative_table_links_read_the_same_body() {
+    use std::io::{Cursor,Read,Write};
+    let temp=isolated();let original=temp.path().join("原始路径.xlsx");let mut book=Workbook::new();let sheet=book.add_worksheet();sheet.write_string(1,0,"001").unwrap();sheet.write_number(2,2,20.).unwrap();sheet.add_table(0,0,5,4095,&rust_xlsxwriter::Table::new()).unwrap();book.save(&original).unwrap();let original=fs::read(original).unwrap();
+    for (index,target) in ["/xl/tables/table1.xml","../../xl/tables/table1.xml"].into_iter().enumerate() {
+        let mut source=zip::ZipArchive::new(Cursor::new(original.clone())).unwrap();let mut output=zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for i in 0..source.len() {
+            let mut file=source.by_index(i).unwrap();let name=file.name().to_owned();let mut bytes=Vec::new();file.read_to_end(&mut bytes).unwrap();
+            if name=="xl/worksheets/_rels/sheet1.xml.rels" {let xml=String::from_utf8(bytes).unwrap();assert!(xml.contains("../tables/table1.xml"));bytes=xml.replace("../tables/table1.xml",target).into_bytes();}
+            output.start_file(name,zip::write::SimpleFileOptions::default()).unwrap();output.write_all(&bytes).unwrap();
+        }
+        let path=temp.path().join(format!("路径{index}.xlsx"));fs::write(&path,output.finish().unwrap().into_inner()).unwrap();let imported=excel_workbench::reader::read(&path).unwrap();assert_eq!(imported.sheets[0].width,3,"{target}");assert!(imported.sheets[0].note.as_ref().is_some_and(|n|n.contains("4093")));
+    }
+}
+
+#[test]
+fn distant_real_values_and_empty_result_formulas_are_never_silently_trimmed() {
+    let temp=isolated();
+    for kind in ["zero","false","formula"] {
+        let path=temp.path().join(format!("{kind}.xlsx"));let mut book=Workbook::new();let sheet=book.add_worksheet();sheet.set_name("说明").unwrap();sheet.write_string(0,0,"001").unwrap();
+        match kind {
+            "zero"=>{sheet.write_number(0,2048,0.).unwrap();},
+            "false"=>{sheet.write_boolean(0,2048,false).unwrap();},
+            _=>{sheet.write_formula(0,2048,rust_xlsxwriter::Formula::new("IF(1=1,\"\",\"\")").set_result("")).unwrap();},
+        }
+        book.save(&path).unwrap();let service=RenameService::default();let file=service.scan(vec![path.to_string_lossy().into()],false).unwrap().files.remove(0);
+        let row=service.live(&file.id,&rules()).unwrap();assert_eq!(row.state,"ready","unreferenced {kind} must not block renaming: {}",row.message);
+        assert_eq!(excel_workbench::reader::read(&path).err().unwrap().code,"LIMIT");
+    }
+}
+
+#[test]
+fn cached_empty_formula_results_keep_their_original_meaning() {
+    let temp=isolated();let path=temp.path().join("空结果公式.xlsx");let mut book=Workbook::new();let sheet=book.add_worksheet();sheet.set_name("说明").unwrap();
+    sheet.write_string(0,0,"001").unwrap();sheet.write_formula(0,1,rust_xlsxwriter::Formula::new("IF(1=1,\"\",\"\")").set_result("")).unwrap();book.save(&path).unwrap();
+    // The writer substitutes numeric zero for an empty supplied result. Use Excel's actual cached-string representation.
+    {
+        use std::io::{Cursor,Read,Write};
+        let mut source=zip::ZipArchive::new(Cursor::new(fs::read(&path).unwrap())).unwrap();let mut output=zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for i in 0..source.len() {
+            let mut file=source.by_index(i).unwrap();let name=file.name().to_owned();let mut bytes=Vec::new();file.read_to_end(&mut bytes).unwrap();
+            if name=="xl/worksheets/sheet1.xml" {
+                let xml=String::from_utf8(bytes).unwrap();assert!(xml.contains("<c r=\"B1\">"));assert!(xml.contains("</f><v>0</v>"));
+                bytes=xml.replace("<c r=\"B1\">","<c r=\"B1\" t=\"str\">").replace("</f><v>0</v>","</f><v></v>").into_bytes();
+            }
+            output.start_file(name,zip::write::SimpleFileOptions::default()).unwrap();output.write_all(&bytes).unwrap();
+        }
+        fs::write(&path,output.finish().unwrap().into_inner()).unwrap();
+    }
+    let service=RenameService::default();let file=service.scan(vec![path.to_string_lossy().into()],false).unwrap().files.remove(0);
+    let page=service.page(&file.id,"说明",0,100).unwrap();assert_eq!(page.sheet.width,2);assert_eq!(page.page.rows[0][1],excel_workbench::model::Cell::Text(String::new()));
+    let mut r=rules();r.parts[0]=RenamePart::Condition {condition:RenameCondition {source:cell("说明",1,2),operator:"nonempty".into(),value:String::new()},text:"标签".into()};r.prefix="文件".into();
+    let row=service.live(&file.id,&r).unwrap();assert_eq!(row.state,"ready","cached empty results must not become missing-cache errors: {}",row.message);assert_eq!(row.new_name,"文件.xlsx");
+    assert_eq!(excel_workbench::reader::read(&path).unwrap().sheets[0].rows[0][1],excel_workbench::model::Cell::Text(String::new()));
+}
 fn output(mode:RenameOutputMode,directory:&Path)->RenameOutput {RenameOutput {mode,directory:Some(directory.to_string_lossy().into()),number_conflicts:true}}
 
 #[test]

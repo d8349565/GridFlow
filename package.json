@@ -1,6 +1,6 @@
 {
   "name": "gridflow",
-  "version": "2.1.1",
+  "version": "2.2.0",
   "description": "汇格 · GridFlow - 本地 Excel / CSV 表格合并与数据分析工作台",
   "private": true,
   "type": "module",

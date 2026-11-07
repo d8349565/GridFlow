@@ -93,6 +93,8 @@ fn multirow_header_range_styles_fixed_values_and_schemes() {
     assert_eq!(cols.iter().map(|c|c.name.as_str()).collect::<Vec<_>>(),vec!["门店编号","收入 / 金额","收入 / 数量"]);
     let suggestions=engine.suggestions(&rules).unwrap();
     assert!(suggestions.iter().find(|s| s.name=="收入 / 数量").unwrap().examples.iter().any(|s| s.before==Cell::Number(3.)));
+    assert_eq!(engine.preview_rules(rules.clone()).err().unwrap().code,"SHEETS","按表分别汇总时仍需先选择目标表");
+    rules.merge_mode=Some("single".into()); // This scenario validates one combined result, independent of the application's default mode.
     let preview=engine.preview_rules(rules.clone()).unwrap();assert_eq!(preview.summary.output_rows,4);
     let result=publish(&engine,rules.clone());let page=engine.query(query(&result.id)).unwrap();
     assert_eq!(page.rows[0],vec![Cell::Number(1200.),Cell::Text("001".into()),Cell::Number(3.),Cell::Text("上海店".into())]);

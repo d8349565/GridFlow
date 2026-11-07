@@ -68,6 +68,9 @@ pub struct SourceSheet {
     pub width: usize,
     pub suggested_header_row: usize,
     pub columns: Vec<Column>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub read_note: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]

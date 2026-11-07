@@ -8,6 +8,7 @@ pub mod model;
 pub mod workflow;
 pub mod reader;
 pub mod rename;
+mod rename_read;
 pub mod rename_config;
 pub mod appearance;
 mod xls_appearance;

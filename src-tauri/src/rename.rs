@@ -1,6 +1,7 @@
 //! Independent, read-only planning followed by journalled, non-overwriting renames.
 use crate::{model::*, reader};
-use calamine::{open_workbook_auto, Data, Range, Reader, Sheets};
+use calamine::{open_workbook_auto, Data, Reader, Sheets};
+use crate::rename_read::{Scope, SheetCells};
 use serde::{Deserialize, Serialize};
 use std::{collections::{HashMap, HashSet}, fs::{self, File, FileTimes, OpenOptions}, io::{BufRead, BufReader, Read, Write}, path::{Path, PathBuf}, sync::{atomic::{AtomicBool, Ordering}, Mutex}, time::UNIX_EPOCH};
 use ts_rs::TS;
@@ -47,7 +48,8 @@ pub struct RenameFile { pub id: String, pub path: String, pub name: String }
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct RenameScan { pub files: Vec<RenameFile>, pub warnings: Vec<String> }
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
-pub struct RenamePage { pub sheet: SourceSheet, pub page: DataPage, pub appearance: SheetAppearance }
+#[serde(rename_all = "camelCase")]
+pub struct RenamePage { pub sheet: SourceSheet, pub page: DataPage, pub appearance: SheetAppearance, pub column_offset: usize, pub total_columns: usize }
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct RenameRow {
@@ -68,25 +70,37 @@ fn stamp(path: &Path) -> Result<Stamp> {
     if !meta.is_file() || meta.file_type().is_symlink() { return Err(AppError::new("FILE", "仅处理普通文件，不处理链接或文件夹")); }
     Ok(Stamp { size: meta.len(), modified: meta.modified()?.duration_since(UNIX_EPOCH).map_err(|e| AppError::new("FILE", e.to_string()))?.as_nanos() })
 }
-struct SheetData { values: Range<Data>, formulas: Range<String> }
-struct Book { path: String, stamp: Stamp, workbook: Sheets<BufReader<File>>, sheets: HashMap<String, SheetData> }
+struct Book { path: String, stamp: Stamp, workbook: Sheets<BufReader<File>>, scopes: HashMap<String,Scope>, sheets: HashMap<String,(Scope,SheetCells)> }
 impl Book {
     fn open(path: &str) -> Result<Self> {
         let mark = stamp(Path::new(path))?;
         if mark.size > 100 * 1024 * 1024 { return Err(AppError::new("LIMIT", "单文件超过 100MB，请拆分后处理")); }
         let workbook = open_workbook_auto(path).map_err(|e| AppError::new("EXCEL", format!("无法读取 Excel，可能已损坏、加密或被占用：{e}")))?;
-        Ok(Self { path: path.into(), stamp: mark, workbook, sheets: HashMap::new() })
+        Ok(Self { path: path.into(), stamp: mark, workbook, scopes: HashMap::new(), sheets: HashMap::new() })
     }
-    fn sheet(&mut self, name: &str) -> Result<&SheetData> {
-        if !self.sheets.contains_key(name) {
-            let values = self.workbook.worksheet_range(name).map_err(|e| AppError::new("SHEET", format!("无法读取工作表“{name}”：{e}")))?;
-            let formulas = self.workbook.worksheet_formula(name).map_err(|e| AppError::new("SHEET", format!("无法读取“{name}”的公式：{e}")))?;
-            let (height, width) = dimensions(&values, &formulas);
-            let cached_cells: usize = self.sheets.values().map(|s| s.values.get_size().0.saturating_mul(s.values.get_size().1)).sum();
-            if width > 2048 || height.saturating_mul(width).saturating_add(cached_cells) > 20_000_000 { return Err(AppError::new("LIMIT", "本文件需要读取的区域超过 2048 列或 2000 万个单元格，请缩小范围")); }
-            self.sheets.insert(name.into(), SheetData { values, formulas });
+    fn configure(&mut self, rules: &RenameRules) {
+        let mut scopes = HashMap::<String,Scope>::new();
+        fn cell(scopes: &mut HashMap<String,Scope>, c: &RenameCell) { scopes.entry(c.sheet.clone()).or_default().areas.push(SheetRange {start_row:c.row,end_row:c.row,start_column:c.column,end_column:c.column}); }
+        for part in &rules.parts {match part {RenamePart::Cell {source,..}|RenamePart::Lookup {source,..}=>cell(&mut scopes,source),RenamePart::Condition {condition,..}=>cell(&mut scopes,&condition.source),RenamePart::Text {..}=>{}}}
+        for check in &rules.checks {
+            cell(&mut scopes,&check.expected);
+            for sum in &check.sums {
+                let scope=scopes.entry(sum.area.sheet.clone()).or_default();scope.areas.push(sum.area.range.clone());
+                if sum.min_filled>0 {scope.filled_rows.push((sum.area.range.start_row,sum.area.range.end_row));}
+                if let Some(condition)=&sum.condition {cell(&mut scopes,&condition.source);}
+            }
         }
-        Ok(&self.sheets[name])
+        for scope in scopes.values_mut() {scope.areas.sort_by_key(|r|(r.start_row,r.start_column,r.end_row,r.end_column));scope.areas.dedup();scope.filled_rows.sort();scope.filled_rows.dedup();}
+        self.sheets.retain(|name,(scope,_)|scopes.get(name)==Some(scope));self.scopes=scopes;
+    }
+    fn sheet(&mut self, name: &str) -> Result<&SheetCells> {
+        if !self.sheets.contains_key(name) {
+            let scope=self.scopes.get(name).cloned().unwrap_or_default();
+            let cached_cells:usize=self.sheets.values().map(|(_,s)|s.cells.len()).sum();
+            let data=crate::rename_read::read(&mut self.workbook,Path::new(&self.path),name,&scope,20_000_000usize.saturating_sub(cached_cells))?;
+            self.sheets.insert(name.into(),(scope,data));
+        }
+        Ok(&self.sheets[name].1)
     }
     fn cell(&mut self, source: &RenameCell) -> Result<Cell> {
         validate_cell(source)?;
@@ -106,27 +120,17 @@ impl Book {
         if let Some(c) = &sum.condition { if !self.condition(c)? { return Ok(0.); } }
         let s = self.sheet(&sum.area.sheet)?;
         let r = &sum.area.range;
-        let height = dimensions(&s.values, &s.formulas).0;
         let mut total = 0.;
-        for row in r.start_row..=r.end_row.min(height) {
-            if sum.min_filled > 0 {
-                let count = (s.values.start().map(|p| p.1).unwrap_or(0)..=s.values.end().map(|p| p.1).unwrap_or(0))
-                    .filter(|col| s.values.get_value(((row - 1) as u32, *col)).is_some_and(|v| !matches!(v, Data::Empty) && !matches!(v, Data::String(t) if t.trim().is_empty()))).count();
-                if count < sum.min_filled { continue; }
-            }
-            for col in r.start_column..=r.end_column {
-                let value = checked_cell(s, row, col)?;
-                if value == Cell::Empty || value.text().trim().is_empty() { continue; }
-                total += numeric(&value).map_err(|_| AppError::new("NUMBER", format!("{}!{} 不是可计算的数字", sum.area.sheet, reader::cell_address(row, col))))?;
-            }
+        for (&(row,col),_) in s.cells.range((r.start_row,0)..=(r.end_row,usize::MAX)) {
+            if col<r.start_column || col>r.end_column || (sum.min_filled>0 && s.filled.get(&row).copied().unwrap_or(0)<sum.min_filled) {continue;}
+            let value = checked_cell(s, row, col)?;
+            if value == Cell::Empty || value.text().trim().is_empty() { continue; }
+            total += numeric(&value).map_err(|_| AppError::new("NUMBER", format!("{}!{} 不是可计算的数字", sum.area.sheet, reader::cell_address(row, col))))?;
         }
         let value = total / sum.divisor;
         if !value.is_finite() { return Err(AppError::new("NUMBER", "合计超出可计算范围")); }
         Ok(value)
     }
-}
-fn dimensions(values: &Range<Data>, formulas: &Range<String>) -> (usize, usize) {
-    [values.end(), formulas.end()].into_iter().flatten().fold((0, 0), |(r, c), p| (r.max(p.0 as usize + 1), c.max(p.1 as usize + 1)))
 }
 fn to_cell(value: &Data) -> Cell {
     match value {
@@ -136,11 +140,11 @@ fn to_cell(value: &Data) -> Cell {
         Data::DateTimeIso(v) => Cell::Date(v.clone()), Data::Error(v) => Cell::Text(format!("#Excel错误:{v:?}")),
     }
 }
-fn checked_cell(sheet: &SheetData, row: usize, column: usize) -> Result<Cell> {
-    let pos = ((row - 1) as u32, (column - 1) as u32);
-    let data = sheet.values.get_value(pos).unwrap_or(&Data::Empty);
+fn checked_cell(sheet: &SheetCells, row: usize, column: usize) -> Result<Cell> {
+    let cell = sheet.cells.get(&(row,column));
+    let data = cell.map(|c|&c.value).unwrap_or(&Data::Empty);
     if matches!(data, Data::Error(_)) { return Err(AppError::new("CELL", format!("{} 包含 Excel 错误", reader::cell_address(row, column)))); }
-    if matches!(data, Data::Empty) && sheet.formulas.get_value(pos).is_some_and(|v| !v.is_empty()) {
+    if matches!(data, Data::Empty) && cell.is_some_and(|c|c.formula) {
         return Err(AppError::new("FORMULA", format!("{} 的公式没有缓存值，请在 Excel 中重新计算并保存", reader::cell_address(row, column))));
     }
     Ok(to_cell(data))
@@ -150,7 +154,7 @@ fn numeric(cell: &Cell) -> Result<f64> {
     n.filter(|v| v.is_finite()).ok_or_else(|| AppError::new("NUMBER", "单元格为空或不是有效数字"))
 }
 fn validate_cell(cell: &RenameCell) -> Result<()> {
-    if cell.sheet.is_empty() || cell.row == 0 || cell.row > 1_048_576 || cell.column == 0 || cell.column > 2048 { return Err(AppError::new("RULE", "请选择有效的工作表和单元格")); }
+    if cell.sheet.is_empty() || cell.row == 0 || cell.row > 1_048_576 || cell.column == 0 || cell.column > 16384 { return Err(AppError::new("RULE", "请选择有效的工作表和单元格")); }
     Ok(())
 }
 fn validate_rules(rules: &RenameRules) -> Result<()> {
@@ -174,7 +178,7 @@ fn validate_rules(rules: &RenameRules) -> Result<()> {
         for sum in &check.sums {
             let r = &sum.area.range;
             validate_cell(&RenameCell { sheet: sum.area.sheet.clone(), row: r.start_row, column: r.start_column })?;
-            if r.end_row < r.start_row || r.end_column < r.start_column || r.end_row > 1_048_576 || r.end_column > 2048 || (r.end_row - r.start_row + 1).saturating_mul(r.end_column - r.start_column + 1) > 20_000_000 || !sum.divisor.is_finite() || sum.divisor <= 0. || sum.min_filled > 2048 { return Err(AppError::new("RULE", "合计区域或单位除数无效")); }
+            if r.end_row < r.start_row || r.end_column < r.start_column || r.end_row > 1_048_576 || r.end_column > 16384 || (r.end_row - r.start_row + 1).saturating_mul(r.end_column - r.start_column + 1) > 20_000_000 || !sum.divisor.is_finite() || sum.divisor <= 0. || sum.min_filled > 16384 { return Err(AppError::new("RULE", "合计区域或单位除数无效")); }
             if let Some(c) = &sum.condition { validate_cell(&c.source)?; }
         }
     }
@@ -194,6 +198,7 @@ fn lookup_tables(rules: &RenameRules) -> Vec<HashMap<&str, &str>> {
     rules.parts.iter().map(|p| match p { RenamePart::Lookup { entries, .. } => entries.iter().map(|e| (e.key.trim(), e.value.trim())).collect(), _ => HashMap::new() }).collect()
 }
 fn row_for(file: &RenameFile, rules: &RenameRules, lookups: &[HashMap<&str, &str>], book: &mut Book, output:&RenameOutput) -> Result<RenameRow> {
+    book.configure(rules);
     let mut values = Vec::new();
     for (index, part) in rules.parts.iter().enumerate() {
         let value = match part {
@@ -308,16 +313,25 @@ impl RenameService {
         work(cache.as_mut().unwrap())
     }
     pub fn page(&self, file_id: &str, sheet: &str, offset: usize, limit: usize) -> Result<RenamePage> {
+        self.page_window(file_id,sheet,offset,limit,0)
+    }
+    pub fn page_window(&self, file_id: &str, sheet: &str, offset: usize, limit: usize, column_offset: usize) -> Result<RenamePage> {
         let file = self.file(file_id)?;
         self.cached(&file, |book| {
-            let data = book.sheet(sheet)?;
-            let (height, width) = dimensions(&data.values, &data.formulas);
-            let width = width.max(1); let height = height.max(1);
-            let end = offset.saturating_add(limit.min(200)).min(height);
-            let rows = (offset..end).map(|row| (0..width).map(|col| checked_cell(data, row+1, col+1).unwrap_or_else(|e| Cell::Text(format!("#{}", e.message)))).collect()).collect();
-            let columns: Vec<Column> = (1..=width).map(|c| Column { key: format!("c{c}"), name: reader::cell_address(1,c).trim_end_matches('1').into(), data_type: ColumnType::Auto, suggested_type: ColumnType::Auto }).collect();
-            let appearance = crate::appearance::read(Path::new(&file.path), sheet, width, offset, limit).unwrap_or_else(|e| SheetAppearance { widths: vec![110.;width], default_row_height:32., show_grid_lines:true, note:Some(format!("原表格式无法显示，已使用标准网格：{}",e.message)), ..Default::default() });
-            Ok(RenamePage { sheet: SourceSheet { id: format!("{}:{sheet}", file.id), file_id: file.id.clone(), name: sheet.into(), rows: height, width, suggested_header_row:1, columns: columns.clone() }, page: DataPage { columns, rows, row_numbers:(offset+1..=end).collect(), total:height, offset, sample:false }, appearance })
+            if column_offset>=16384 || offset>=1_048_576 {return Err(AppError::new("RANGE","预览位置超出Excel范围"));}
+            let limit=limit.clamp(1,200);let window_width=(16384-column_offset).min(80);
+            let scope=Scope {areas:vec![SheetRange {start_row:offset+1,end_row:(offset+limit).min(1_048_576),start_column:column_offset+1,end_column:column_offset+window_width}],filled_rows:vec![]};
+            let data=crate::rename_read::read(&mut book.workbook,Path::new(&file.path),sheet,&scope,200*80)?;
+            let height=data.rows.clamp(1,1_048_576);let declared_columns=data.columns.clamp(1,16384);
+            let width=if declared_columns>column_offset {(declared_columns-column_offset).min(window_width)}else{window_width};
+            let total_columns=declared_columns.max(column_offset+width);
+            let end=if offset>=height {(offset+limit).min(1_048_576)}else{(offset+limit).min(height)};
+            let rows = (offset..end).map(|row| (column_offset..column_offset+width).map(|col| checked_cell(&data,row+1,col+1).unwrap_or_else(|e| Cell::Text(format!("#{}",e.message)))).collect()).collect();
+            let columns:Vec<Column>=(column_offset+1..=column_offset+width).map(|c|Column {key:format!("c{c}"),name:reader::cell_address(1,c).trim_end_matches('1').into(),data_type:ColumnType::Auto,suggested_type:ColumnType::Auto}).collect();
+            let note=format!("当前预览 {}–{} 列，按行加载；核对只读取规则指定内容。",reader::cell_address(1,column_offset+1).trim_end_matches('1'),reader::cell_address(1,column_offset+width).trim_end_matches('1'));
+            let mut appearance=crate::appearance::read_window(Path::new(&file.path),sheet,width,offset,limit,column_offset).unwrap_or_else(|e|SheetAppearance {widths:vec![110.;width],default_row_height:32.,show_grid_lines:true,note:Some(format!("原表格式无法显示：{}",e.message)),..Default::default()});
+            appearance.note=Some(match appearance.note.take() {Some(old)=>format!("{note}；{old}"),None=>note.clone()});
+            Ok(RenamePage {sheet:SourceSheet {id:format!("{}:{sheet}:{column_offset}",file.id),file_id:file.id.clone(),name:sheet.into(),rows:height,width,suggested_header_row:1,columns:columns.clone(),read_note:Some(note)},page:DataPage {columns,rows,row_numbers:(offset+1..=end).collect(),total:height,offset,sample:false},appearance,column_offset,total_columns})
         })
     }
     pub fn live(&self, file_id: &str, rules: &RenameRules) -> Result<RenameRow> {

@@ -1,15 +1,135 @@
 use crate::model::*;
-use calamine::{open_workbook_auto, Data, Reader};
-use std::{collections::HashMap, path::Path};
+use calamine::{open_workbook_auto, Cell as ExcelCell, Data, DataRef, Range, Reader, Sheets, XlsxError};
+use std::{collections::HashMap, fs::File, io::BufReader, path::Path};
 
 pub struct ReadSheet {
     pub name: String,
     pub rows: Vec<Vec<Cell>>,
     pub width: usize,
+    pub note: Option<String>,
+}
+
+struct TableExtent { area: SheetRange, header_end: usize, data_end: usize, read_end: usize }
+impl TableExtent {
+    fn contains(&self, (row, column): (u32, u32)) -> bool {
+        let (row, column) = (row as usize + 1, column as usize + 1);
+        row >= self.area.start_row && row <= self.area.end_row && column >= self.area.start_column && column <= self.area.end_column
+    }
+    fn header(&self, position: (u32, u32)) -> bool { self.contains(position) && position.0 as usize + 1 <= self.header_end }
+    fn include_data(&mut self, position: (u32, u32)) { if self.contains(position) { self.data_end = self.data_end.max(position.1 as usize + 1); } }
+}
+fn table_extents(path: &Path, sheet_name: &str) -> Result<Vec<TableExtent>> {
+    let mut zip = zip::ZipArchive::new(File::open(path)?).map_err(|e| AppError::new("TABLE", e.to_string()))?;
+    let workbook = crate::appearance::xml(&mut zip, "xl/workbook.xml")?;
+    let sheet = crate::appearance::sheet_path(&mut zip, &workbook, sheet_name)?;
+    let (folder, file) = sheet.rsplit_once('/').unwrap_or(("", sheet.as_str()));
+    let relationships = crate::appearance::xml(&mut zip, &format!("{folder}/_rels/{file}.rels"))?;
+    let mut parts = Vec::new();
+    crate::appearance::visit(&relationships, |tag,a,end| {
+        if !end && tag == "Relationship" && a.get("Type").is_some_and(|v| v.ends_with("/table")) && a.get("TargetMode").is_none_or(|v| v != "External") {
+            if let Some(target) = a.get("Target") { parts.push(crate::appearance::resolve_part(&sheet, target)); }
+        }
+    })?;
+    let mut tables = Vec::new();
+    for part in parts {
+        crate::appearance::visit(&crate::appearance::xml(&mut zip, &part)?, |tag, a, end| {
+            if tag != "table" || end { return; }
+            let Some(area) = a.get("ref").and_then(|v| crate::appearance::range(v)) else { return; };
+            let headers = a.get("headerRowCount").and_then(|v| v.parse::<usize>().ok()).unwrap_or(1);
+            if headers == 0 || headers > area.end_row - area.start_row + 1 { return; }
+            tables.push(TableExtent { header_end: area.start_row + headers - 1, data_end: area.start_column, read_end: area.end_column, area });
+        })?;
+    }
+    Ok(tables)
 }
 pub struct ReadFile {
     pub sheets: Vec<ReadSheet>,
     pub encoding: Option<String>,
+}
+
+fn excel_bounds(size: &mut (usize, usize), position: (u32, u32), max_cells: usize) -> Result<()> {
+    size.0 = size.0.max(position.0 as usize + 1);
+    size.1 = size.1.max(position.1 as usize + 1);
+    if size.1 > 2048 || size.0.saturating_mul(size.1) > max_cells {
+        return Err(AppError::new("LIMIT", "工作表有效内容超过 2048 列或可用单元格上限（已忽略尾部空白），请缩小实际数据范围"));
+    }
+    Ok(())
+}
+
+/// Filter empty tails before constructing a dense range: a distant blank cell must not allocate the whole Excel grid.
+pub(crate) fn excel_sheet(book: &mut Sheets<BufReader<File>>, path: &Path, name: &str, max_cells: usize) -> Result<(Range<Data>, Range<String>, Option<String>)> {
+    let error = |e| AppError::new("SHEET", format!("无法读取工作表“{name}”：{e}"));
+    let mut size = (0, 0);
+    if let Sheets::Xlsx(xlsx) = book {
+        // Table metadata is optional. If it cannot be verified, retain headers and keep the normal safety limits.
+        let mut tables = table_extents(path, name).unwrap_or_default();
+        let mut formulas = Vec::new();
+        {
+            let mut cells = match xlsx.worksheet_cells_reader(name) {
+                Ok(reader) => reader,
+                Err(XlsxError::NotAWorksheet(_)) => return Ok((Range::empty(), Range::empty(), None)),
+                Err(e) => return Err(error(e)),
+            };
+            while let Some(cell) = cells.next_formula().map_err(error)? {
+                if !cell.get_value().is_empty() {
+                    for table in &mut tables { table.include_data(cell.get_position()); }
+                    excel_bounds(&mut size, cell.get_position(), max_cells)?; formulas.push(cell);
+                }
+            }
+        }
+        let formulas = Range::from_sparse(formulas);
+        let mut values = Vec::new();
+        let mut headers = Vec::new();
+        let mut cells = xlsx.worksheet_cells_reader(name).map_err(error)?;
+        while let Some(cell) = cells.next_cell().map_err(error)? {
+            let position = cell.get_position();
+            let blank = match cell.get_value() { DataRef::Empty => true, DataRef::String(v) => v.trim().is_empty(), DataRef::SharedString(v) => v.trim().is_empty(), _ => false };
+            // A cached empty formula result differs from a formula with no saved result.
+            let cached_formula = !matches!(cell.get_value(), DataRef::Empty) && formulas.get_value(position).is_some_and(|v| !v.is_empty());
+            if !blank || cached_formula {
+                if !cached_formula {
+                    if let Some(index) = tables.iter().position(|t| t.header(position)) {
+                        headers.push((index, ExcelCell::new(position, Data::from(cell.get_value().clone())))); continue;
+                    }
+                }
+                for table in &mut tables { table.include_data(position); }
+                excel_bounds(&mut size, position, max_cells)?;
+                values.push(ExcelCell::new(position, Data::from(cell.get_value().clone())));
+            }
+        }
+        let mut ignored = 0;
+        for table in &mut tables {
+            if table.area.end_column > 2048 || size.0.max(table.header_end).saturating_mul(table.area.end_column) > max_cells {
+                table.read_end = table.data_end;
+                ignored += table.area.end_column - table.read_end;
+            }
+        }
+        for (index, cell) in headers {
+            if cell.get_position().1 as usize + 1 <= tables[index].read_end {
+                excel_bounds(&mut size, cell.get_position(), max_cells)?; values.push(cell);
+            }
+        }
+        let note = (ignored > 0).then(|| format!("超级表尾部 {ignored} 列仅含表头、下方无数据，已限制读取范围；原文件未修改。"));
+        return Ok((Range::from_sparse(values), formulas, note));
+    }
+    let values = book.worksheet_range(name).map_err(|e| AppError::new("SHEET", format!("无法读取工作表“{name}”：{e}")))?;
+    let formulas = book.worksheet_formula(name).map_err(|e| AppError::new("SHEET", format!("无法读取工作表“{name}”的公式：{e}")))?;
+    let origin = values.start().unwrap_or((0, 0));
+    let mut bounds: Option<((u32, u32), (u32, u32))> = None;
+    for (r, c, value) in values.used_cells() {
+        let position = (origin.0 + r as u32, origin.1 + c as u32);
+        if matches!(value, Data::String(v) if v.trim().is_empty()) && !formulas.get_value(position).is_some_and(|v| !v.is_empty()) { continue; }
+        excel_bounds(&mut size, position, max_cells)?;
+        let (start, end) = bounds.get_or_insert((position, position));
+        start.0 = start.0.min(position.0); start.1 = start.1.min(position.1); end.0 = end.0.max(position.0); end.1 = end.1.max(position.1);
+    }
+    if let Some(end) = formulas.end() { excel_bounds(&mut size, end, max_cells)?; }
+    let values = match bounds {
+        Some((start, end)) if Some(start) == values.start() && Some(end) == values.end() => values,
+        Some((start, end)) => values.range(start, end),
+        None => Range::empty(),
+    };
+    Ok((values, formulas, None))
 }
 
 pub fn read(path: &Path) -> Result<ReadFile> {
@@ -32,22 +152,13 @@ fn read_excel(path: &Path) -> Result<ReadFile> {
         .map_err(|e| AppError::new("EXCEL", format!("Excel 无法读取（可能已损坏或加密）：{e}")))?;
     let mut sheets = Vec::new();
     for name in book.sheet_names().to_owned() {
-        let range = book
-            .worksheet_range(&name)
-            .map_err(|e| AppError::new("EXCEL", e.to_string()))?;
-        let formulas = book.worksheet_formula(&name).ok();
-        let ends = [range.end(), formulas.as_ref().and_then(|f| f.end())]
+        let (range, formulas, note) = excel_sheet(&mut book, path, &name, 20_000_000)?;
+        let ends = [range.end(), formulas.end()]
             .into_iter()
             .flatten()
             .collect::<Vec<_>>();
         let height = ends.iter().map(|p| p.0 as usize + 1).max().unwrap_or(0);
         let width = ends.iter().map(|p| p.1 as usize + 1).max().unwrap_or(0);
-        if width > 2048 || height.saturating_mul(width) > 20_000_000 {
-            return Err(AppError::new(
-                "LIMIT",
-                "工作表展开范围超过 2048 列或 2000 万个单元格，请缩小源表范围",
-            ));
-        }
         let mut rows = Vec::with_capacity(height);
         for r in 0..height {
             let mut cells = Vec::with_capacity(width);
@@ -58,8 +169,7 @@ fn read_excel(path: &Path) -> Result<ReadFile> {
                 let cell = match value {
                     Data::Empty => {
                         let has_formula = formulas
-                            .as_ref()
-                            .and_then(|f| f.get_value((r as u32, c as u32)))
+                            .get_value((r as u32, c as u32))
                             .is_some_and(|v| !v.is_empty());
                         if has_formula {
                             Cell::Text("#公式无缓存".into())
@@ -84,7 +194,7 @@ fn read_excel(path: &Path) -> Result<ReadFile> {
             rows.push(cells);
         }
 
-        sheets.push(ReadSheet { name, rows, width });
+        sheets.push(ReadSheet { name, rows, width, note });
     }
     if sheets.is_empty() {
         return Err(AppError::new("EMPTY", "工作簿没有工作表"));
@@ -169,6 +279,7 @@ fn read_csv(path: &Path) -> Result<ReadFile> {
             name: "CSV".into(),
             rows,
             width,
+            note: None,
         }],
         encoding: Some(encoding),
     })

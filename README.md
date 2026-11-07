@@ -2,7 +2,7 @@
 
 > **汇格（GridFlow）** 是一款面向 Windows 桌面端的专业本地表格合并与分析工具：专为日常办公中繁重复杂的多表汇总需求设计，无需编写脚本或复杂公式，通过可视化直观操作，将分散、异构的多份 Excel / CSV 快速合并为规范母表，并直接在本地完成数据清洗、多维汇总统计与图表分析。全部计算与存储均在本机离线完成，商业数据零泄露。
 
-[![Release](https://img.shields.io/badge/Release-v2.0.0-blue.svg)](https://github.com/d8349565/GridFlow/releases)
+[![Release](https://img.shields.io/badge/Release-v2.2.0-blue.svg)](https://github.com/d8349565/GridFlow/releases)
 [![Download](https://img.shields.io/badge/Download-Releases-orange.svg)](https://github.com/d8349565/GridFlow/releases)
 [![Platform](https://img.shields.io/badge/Platform-Windows%2010%20%7C%2011%20x64-0078d4.svg)](#下载与使用-installation)
 [![Data Privacy](https://img.shields.io/badge/Privacy-100%25%20Local%20%26%20Offline-success.svg)](#数据存储与安全-configuration--privacy)
@@ -17,7 +17,7 @@
 
 软件开箱即用，无需预装 Python、Node.js 或数据库服务：
 
-1. 前往 [Releases 下载页](https://github.com/d8349565/GridFlow/releases) 下载最新发行包 `GridFlow-v2.0.0-win-x64.zip`；
+1. 前往 [Releases 下载页](https://github.com/d8349565/GridFlow/releases) 下载最新发行包 `GridFlow-v2.2.0-win-x64-*.zip`；
 2. 解压到本地任意目录（保持同级目录自带的 `duckdb.dll` 不被移动或删除）；
 3. 双击 `GridFlow.exe` 即可直接运行。
 
@@ -52,7 +52,7 @@
 
 ## 核心能力 (Features)
 
-当前源码新增独立的「批量重命名」入口：在 Excel 预览中点选命名内容，按需添加编码对照、金额/数量校验和条件标签，实时预览后确认执行，支持集中复制或移动到一个文件夹、本机命名配置库，并可导出日志或撤销。跨电脑使用命名配置时，通过密码加密的配置文件导出、导入。该功能尚未发布，详见[操作与验证说明](docs/rename.md)。
+v2.2.0 新增独立的「批量重命名」入口：在 Excel 预览中点选命名内容，按需添加编码对照、金额/数量校验和条件标签，实时预览后确认执行，支持集中复制或移动到一个文件夹、本机命名配置库，并可导出日志或撤销。跨电脑使用命名配置时，通过密码加密的配置文件导出、导入。详见[操作与验证说明](docs/rename.md)。
 
 - **高保真原表还原** — 深度兼容 Excel 原生样式，保留字体、字号、颜色、对齐、边框、合并单元格及隐藏行列，保留视觉上下文，不修改用户原始文件。
 - **复合表头与固定信息智能抽取** — 轻松处理多层合并表头，并能将孤立单元格（门店、日期、部门等）一键平铺为新增数据列。
@@ -124,7 +124,7 @@ npm run test:ui     # 执行 Playwright 界面自动化契约测试
 # 构建便携发布包（也可直接双击根目录「一键打包.bat」或运行 package.bat）
 npm run release
 ```
-打包完成后将在 `release/` 目录生成带有 SHA-256 校验的 `GridFlow-v2.0.0-win-x64-*.zip` 便携包与 `latest.json` 元数据文件。
+打包完成后将在 `release/` 目录生成带有 SHA-256 校验的 `GridFlow-v2.2.0-win-x64-*.zip` 便携包与 `latest.json` 元数据文件。
 
 十万行、二十列基准测试：
 ```powershell

@@ -373,6 +373,7 @@ SPU-201,精品挂耳咖啡包,咖啡周边,220,68,14960,2
                         width: sheet.width,
                         suggested_header_row: header,
                         columns,
+                        read_note: sheet.note,
                     });
                 }
                 Ok::<_, AppError>(sheets)
@@ -491,9 +492,11 @@ SPU-201,精品挂耳咖啡包,咖啡周边,220,68,14960,2
         let sheet = self.lookup_sheet(sheet_id)?;
         let path = self.workspace.lock().unwrap().files.iter().find(|f| f.id == sheet.file_id)
             .map(|f| f.stored_path.clone()).ok_or_else(|| AppError::new("NOT_FOUND", "原文件副本不存在"))?;
-        Ok(crate::appearance::read(Path::new(&path), &sheet.name, sheet.width, offset, limit).unwrap_or_else(|e| SheetAppearance {
+        let mut look = crate::appearance::read(Path::new(&path), &sheet.name, sheet.width, offset, limit).unwrap_or_else(|e| SheetAppearance {
             widths: vec![110.; sheet.width],default_row_height:32.,show_grid_lines:true, note: Some(format!("原表格式暂时无法显示，使用标准网格：{}",e.message)), ..Default::default()
-        }))
+        });
+        if let Some(note) = &sheet.read_note { look.note = Some(match look.note.take() { Some(old) => format!("{note}；{old}"), None => note.clone() }); }
+        Ok(look)
     }
     fn padded_for_sheet(&self,sheet:&SourceSheet)->HashMap<(usize,usize),usize> {
         let path=self.workspace.lock().unwrap().files.iter().find(|f|f.id==sheet.file_id).map(|f|f.stored_path.clone());

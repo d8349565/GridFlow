@@ -8,14 +8,14 @@ fn attrs(e: &quick_xml::events::BytesStart<'_>, decoder: quick_xml::encoding::De
         Some((String::from_utf8_lossy(a.key.as_ref()).split(':').last()?.into(), a.decode_and_unescape_value(decoder).ok()?.into_owned()))
     }).collect()
 }
-fn xml(zip: &mut zip::ZipArchive<File>, name: &str) -> Result<String> {
+pub(crate) fn xml(zip: &mut zip::ZipArchive<File>, name: &str) -> Result<String> {
     let file = zip.by_name(name).map_err(|e| AppError::new("LAYOUT", e.to_string()))?;
     if file.size() > 80_000_000 { return Err(AppError::new("LAYOUT", "格式文件较大，使用标准网格显示")); }
     let mut value = String::new();
     file.take(80_000_001).read_to_string(&mut value)?;
     Ok(value)
 }
-fn visit(value: &str, mut action: impl FnMut(&str, &HashMap<String, String>, bool)) -> Result<()> {
+pub(crate) fn visit(value: &str, mut action: impl FnMut(&str, &HashMap<String, String>, bool)) -> Result<()> {
     let mut r = Reader::from_str(value);
     loop {
         match r.read_event() {
@@ -31,6 +31,21 @@ fn visit(value: &str, mut action: impl FnMut(&str, &HashMap<String, String>, boo
         }
     }
     Ok(())
+}
+pub(crate) fn resolve_part(base: &str, target: &str) -> String {
+    let path = if target.starts_with('/') { target.to_string() } else { format!("{}/{target}", base.rsplit_once('/').map(|v| v.0).unwrap_or("")) };
+    let mut parts = Vec::new();
+    for part in path.split('/') { match part { "." | "" => {}, ".." => { parts.pop(); }, _ => parts.push(part) } }
+    parts.join("/")
+}
+pub(crate) fn sheet_path(zip: &mut zip::ZipArchive<File>, workbook: &str, sheet_name: &str) -> Result<String> {
+    let mut relation = String::new();
+    visit(workbook, |tag,a,end| { if !end && tag == "sheet" && a.get("name").is_some_and(|v| v == sheet_name) { relation = a.get("id").cloned().unwrap_or_default(); } })?;
+    let mut target = String::new();
+    visit(&xml(zip, "xl/_rels/workbook.xml.rels")?, |tag,a,end| {
+        if !end && tag == "Relationship" && a.get("Id").is_some_and(|v| *v == relation) && a.get("TargetMode").is_none_or(|v| v != "External") { target = a.get("Target").cloned().unwrap_or_default(); }
+    })?;
+    Ok(resolve_part("xl/workbook.xml", &target))
 }
 fn index(a: &HashMap<String, String>, key: &str) -> usize { a.get(key).and_then(|s| s.parse().ok()).unwrap_or(0) }
 pub(crate) fn indexed_palette() -> Vec<String> {
@@ -131,35 +146,35 @@ pub fn range(value: &str) -> Option<SheetRange> {
     Some(SheetRange { start_row: a.0.min(b.0), end_row: a.0.max(b.0), start_column: a.1.min(b.1), end_column: a.1.max(b.1) })
 }
 pub fn read(path: &Path, sheet_name: &str, width: usize, offset: usize, limit: usize) -> Result<SheetAppearance> {
-    read_internal(path,sheet_name,width,offset,limit,false)
+    read_internal(path,sheet_name,width,offset,limit,false,0)
+}
+pub(crate) fn read_window(path: &Path, sheet: &str, width: usize, offset: usize, limit: usize, column_offset: usize) -> Result<SheetAppearance> {
+    read_internal(path,sheet,width,offset,limit,false,column_offset)
 }
 pub(crate) fn padded_cells(path:&Path,sheet_name:&str,width:usize)->Result<HashMap<(usize,usize),usize>> {
-    let look=read_internal(path,sheet_name,width,0,usize::MAX,true)?;
+    let look=read_internal(path,sheet_name,width,0,usize::MAX,true,0)?;
     Ok(look.cells.iter().filter_map(|c| { let f=&look.styles.get(c.style)?.number_format;
         zero_width(f).map(|n|((c.row,c.column),n))
     }).collect())
 }
 fn zero_width(s:&str)->Option<usize> { if s.len()>1 && s.len()<=40 && s.chars().all(|v|v=='0'){Some(s.len())}else{None} }
-fn read_internal(path: &Path, sheet_name: &str, width: usize, offset: usize, limit: usize, only_padded:bool) -> Result<SheetAppearance> {
+fn read_internal(path: &Path, sheet_name: &str, width: usize, offset: usize, limit: usize, only_padded:bool, column_offset:usize) -> Result<SheetAppearance> {
     let mut out = SheetAppearance { widths: vec![64.; width],default_row_height:20.,show_grid_lines:true, ..Default::default() };
     if path.extension().and_then(|v| v.to_str()).is_none_or(|v| !v.eq_ignore_ascii_case("xlsx")) {
         if path.extension().and_then(|v| v.to_str()).is_some_and(|v| v.eq_ignore_ascii_case("xls")) {
-            let mut v=crate::xls_appearance::read(path,sheet_name,width,offset,if only_padded{limit}else{limit.min(1000)})?;
+            let mut v=crate::xls_appearance::read(path,sheet_name,width+column_offset,offset,if only_padded{limit}else{limit.min(1000)})?;
+            if column_offset>0 {v.widths=v.widths.into_iter().skip(column_offset).take(width).collect();v.cells.retain(|c|c.column>column_offset&&c.column<=column_offset+width);v.merges.retain(|r|r.start_column>column_offset&&r.start_column<=column_offset+width);}
             if only_padded {v.cells.retain(|c|v.styles.get(c.style).is_some_and(|s|zero_width(&s.number_format).is_some()));}return Ok(v);
         }
         return Ok(out);
     }
     let mut zip = zip::ZipArchive::new(File::open(path)?).map_err(|e| AppError::new("LAYOUT", e.to_string()))?;
-    let workbook = xml(&mut zip, "xl/workbook.xml")?; let mut relation = String::new();
+    let workbook = xml(&mut zip, "xl/workbook.xml")?;
     visit(&workbook, |tag,a,end| {
-        if !end && tag == "sheet" && a.get("name").is_some_and(|v| v == sheet_name) { relation = a.get("id").cloned().unwrap_or_default(); }
         if !end && tag == "workbookPr" { out.date_1904=a.get("date1904").is_some_and(|v|v=="1"||v=="true"); }
     })?;
-    let relations = xml(&mut zip, "xl/_rels/workbook.xml.rels")?; let mut target = String::new();
-    visit(&relations, |tag,a,end| { if !end && tag == "Relationship" && a.get("Id").is_some_and(|v| *v == relation) && a.get("TargetMode").is_none_or(|v| v != "External") { target = a.get("Target").cloned().unwrap_or_default(); } })?;
-    let target = if target.starts_with('/') { target.trim_start_matches('/').to_string() } else { format!("xl/{target}") };
-    let mut parts = Vec::new(); for p in target.split('/') { match p { "." | "" => {}, ".." => { parts.pop(); }, _ => parts.push(p) } }
-    let sheet_xml = xml(&mut zip, &parts.join("/"))?;
+    let target = sheet_path(&mut zip, &workbook, sheet_name)?;
+    let sheet_xml = xml(&mut zip, &target)?;
     let theme=theme(&xml(&mut zip,"xl/theme/theme1.xml").unwrap_or_default());
     out.styles = xml(&mut zip, "xl/styles.xml").and_then(|v| styles(&v,&theme)).unwrap_or_else(|_| vec![base_style()]);
     let mut r=Reader::from_str(&sheet_xml);let mut selected=None::<usize>;let mut numeric=false;let mut in_value=false;
@@ -182,21 +197,21 @@ fn read_internal(path: &Path, sheet_name: &str, width: usize, offset: usize, lim
                     },
                     "col" => {
                         let px=if a.get("hidden").is_some_and(|v|v=="1"||v=="true") { 0. } else { a.get("width").and_then(|v|v.parse::<f64>().ok()).filter(|v|v.is_finite()).map(|v|(v*7.+5.).clamp(1.,2500.)).unwrap_or(64.) };
-                        for c in index(&a,"min").max(1)..=index(&a,"max").min(width) {
-                            out.widths[c-1]=px;
+                        for c in index(&a,"min").max(column_offset+1)..=index(&a,"max").min(column_offset+width) {
+                            out.widths[c-column_offset-1]=px;
                             if let Some(w)=a.get("width").and_then(|v|v.parse::<f64>().ok()).filter(|v|v.is_finite()&&*v>=0.) {out.column_widths.insert(c,w);}
                         }
                     },
                     "c" => {
                         selected=None;in_value=false;numeric=a.get("t").is_none_or(|v|v=="n");
                         if let Some((row,column))=a.get("r").and_then(|v|reader::parse_address(v).ok()) {
-                            if row>offset && row<=offset.saturating_add(if only_padded{limit}else{limit.min(1000)}) && column<=width
+                            if row>offset && row<=offset.saturating_add(if only_padded{limit}else{limit.min(1000)}) && column>column_offset && column<=column_offset+width
                                 && (!only_padded || out.styles.get(index(&a,"s")).is_some_and(|s|zero_width(&s.number_format).is_some())) {
                                 out.cells.push(CellAppearance { row,column,style:index(&a,"s"),raw_number:None });selected=Some(out.cells.len()-1);
                             }
                         }
                     },
-                    "mergeCell" => if let Some(v)=a.get("ref").and_then(|v|range(v)) { if out.merges.len()<100_000 { out.merges.push(v); } },
+                    "mergeCell" => if let Some(v)=a.get("ref").and_then(|v|range(v)) { if v.start_column>column_offset && v.start_column<=column_offset+width && out.merges.len()<100_000 { out.merges.push(v); } },
                     _=>{}
                 }
             },
