@@ -29,6 +29,7 @@ export type Scheme = { id: string, name: string, rules: RuleSet, sheets: Array<S
 export type Settings = { passwordHash: string | null, lastExportDirectory: string | null, };
 export type Workspace = { files: Array<SourceFile>, datasets: Array<Dataset>, tasks: Array<Task>, schemes: Array<Scheme>, rules: RuleSet, activeSheetId: string | null, settings: Settings, dataDirectory: string, locked: boolean, activities: Array<Activity>, };
 export type ImportItem = { path: string, file: SourceFile | null, error: string | null, };
+export type ImportProgress = { busy: boolean, done: number, total: number, current: string, phase: string, cancelled: boolean, };
 export type DatasetQuery = { datasetId: string, offset: number, limit: number, sorts: Array<Sort>, filters: Array<Filter>, search: string, };
 export type Sort = { key: string, descending: boolean, };
 export type Filter = { key: string, operator: string, values: Array<string>, };

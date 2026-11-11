@@ -949,6 +949,8 @@ strong {
   height: 100%;
   transition: width 0.2s;
 }
+.import-current { min-width: 0; max-width: 24vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.import-phase { max-width: 28vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .notice {
   display: flex;
   align-items: flex-start;

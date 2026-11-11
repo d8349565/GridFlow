@@ -23,6 +23,8 @@ pub struct Engine {
     queue: mpsc::Sender<String>,
     pub(crate) heavy: Mutex<()>,
     unlocked: AtomicBool,
+    import_state: Mutex<ImportProgress>,
+    import_cancelled: AtomicBool,
 }
 struct LookupIndex<'a> {
     rule: &'a LookupRule,
@@ -38,7 +40,13 @@ impl Engine {
         std::fs::create_dir_all(root.join("imports"))?;
         std::fs::create_dir_all(root.join("results"))?;
         let connection = Connection::open(root.join("workspace.duckdb"))?;
-        connection.execute_batch("SET memory_limit='256MB'; SET threads=2; SET autoinstall_known_extensions=false; SET autoload_known_extensions=false; CREATE TABLE IF NOT EXISTS meta (key VARCHAR PRIMARY KEY, value VARCHAR); CREATE TABLE IF NOT EXISTS issues (dataset_id VARCHAR, file_id VARCHAR, sheet_id VARCHAR, source_row BIGINT, column_name VARCHAR, original_value VARCHAR, message VARCHAR, source_column BIGINT, file_name VARCHAR, sheet_name VARCHAR);")?;
+        let mut system = sysinfo::System::new();
+        system.refresh_memory();
+        // Leave room for Excel decoding, WebView2 and other applications. This is a ceiling, not a reservation.
+        let memory = if system.total_memory() == 0 { 256 * 1024 * 1024 } else {
+            (system.total_memory() / 8).min(system.available_memory() / 4).clamp(64 * 1024 * 1024, 1024 * 1024 * 1024)
+        };
+        connection.execute_batch(&format!("SET memory_limit='{memory}B'; SET threads=2; SET autoinstall_known_extensions=false; SET autoload_known_extensions=false; CREATE TABLE IF NOT EXISTS meta (key VARCHAR PRIMARY KEY, value VARCHAR); CREATE TABLE IF NOT EXISTS issues (dataset_id VARCHAR, file_id VARCHAR, sheet_id VARCHAR, source_row BIGINT, column_name VARCHAR, original_value VARCHAR, message VARCHAR, source_column BIGINT, file_name VARCHAR, sheet_name VARCHAR);"))?;
         connection.execute_batch("ALTER TABLE issues ADD COLUMN IF NOT EXISTS source_column BIGINT DEFAULT 1; ALTER TABLE issues ADD COLUMN IF NOT EXISTS file_name VARCHAR DEFAULT ''; ALTER TABLE issues ADD COLUMN IF NOT EXISTS sheet_name VARCHAR DEFAULT '';")?;
         let saved: Option<String> = connection
             .query_row("SELECT value FROM meta WHERE key='workspace'", [], |r| {
@@ -92,6 +100,8 @@ impl Engine {
             queue,
             heavy: Mutex::new(()),
             unlocked: AtomicBool::new(unlocked),
+            import_state: Mutex::new(ImportProgress::default()),
+            import_cancelled: AtomicBool::new(false),
         });
         engine.persist()?;
         let weak = Arc::downgrade(&engine);
@@ -144,6 +154,10 @@ impl Engine {
         copy.settings.password_hash = ws.settings.password_hash.as_ref().map(|_| "enabled".into());
         copy.locked = false;
         Ok(copy)
+    }
+    pub fn tasks(&self) -> Result<Vec<Task>> {
+        self.guard()?;
+        Ok(self.workspace.lock().unwrap().tasks.clone())
     }
     pub fn save_draft(&self, rules: RuleSet, active_sheet_id: Option<String>) -> Result<()> {
         self.guard()?;
@@ -230,6 +244,18 @@ impl Engine {
         }
         Ok(())
     }
+    pub fn import_progress(&self) -> Result<ImportProgress> {
+        self.guard()?;
+        Ok(self.import_state.lock().unwrap().clone())
+    }
+    pub fn cancel_import(&self) -> Result<()> {
+        self.guard()?;
+        self.import_cancelled.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+    fn check_import_cancelled(&self) -> Result<()> {
+        if self.import_cancelled.load(Ordering::SeqCst) { Err(AppError::new("CANCELLED", "已停止导入，当前未完成文件已撤回")) } else { Ok(()) }
+    }
     pub fn import_files(&self, paths: Vec<String>) -> Result<Vec<ImportItem>> {
         self.guard()?;
         let _gate = self.heavy.lock().unwrap();
@@ -261,9 +287,16 @@ impl Engine {
         if total > 500 * 1024 * 1024 {
             return Err(AppError::new("LIMIT", "本次导入超过 500MB，请分批导入"));
         }
+        self.import_cancelled.store(false, Ordering::SeqCst);
+        *self.import_state.lock().unwrap() = ImportProgress {
+            busy: true, total: expanded.len(), phase: "正在导入".into(), ..Default::default()
+        };
         let mut items = Vec::new();
         for path in expanded {
+            if self.import_cancelled.load(Ordering::SeqCst) { break; }
+            self.import_state.lock().unwrap().current = Path::new(&path).file_name().unwrap_or_default().to_string_lossy().into();
             let result = self.import_one(Path::new(&path));
+            if matches!(&result, Err(error) if error.code == "CANCELLED") { break; }
             items.push(match result {
                 Ok(file) => ImportItem {
                     path,
@@ -276,7 +309,13 @@ impl Engine {
                     error: Some(e.message),
                 },
             });
+            self.import_state.lock().unwrap().done = items.len();
         }
+        let mut progress = self.import_state.lock().unwrap();
+        progress.busy = false;
+        progress.cancelled = self.import_cancelled.load(Ordering::SeqCst) && progress.done < progress.total;
+        progress.phase = if progress.cancelled { "已停止导入" } else { "导入完成" }.into();
+        progress.current.clear();
         Ok(items)
     }
     pub fn load_sample_files(&self) -> Result<Vec<ImportItem>> {
@@ -325,17 +364,19 @@ SPU-201,精品挂耳咖啡包,咖啡周边,220,68,14960,2
         ));
         std::fs::copy(path, &stored)?;
         let result = (|| {
-            let read = reader::read(&stored)?;
             let conn = self.conn()?;
             conn.execute_batch("BEGIN TRANSACTION")?;
+            let mut encoding = None;
             let parsed = (|| {
                 let mut sheets = Vec::new();
-                for sheet in read.sheets {
+                encoding = reader::read_each(&stored, &|| self.check_import_cancelled(), |sheet| {
+                    self.import_state.lock().unwrap().phase = format!("正在写入 {}", sheet.name);
                     let sheet_id = id();
                     let table = format!("r_{sheet_id}");
                     create_table(&conn, &table, sheet.width, false)?;
                     let mut appender = conn.appender(&table)?;
                     for (row, cells) in sheet.rows.iter().enumerate() {
+                        if row % 256 == 0 { self.check_import_cancelled()?; }
                         append_cells(&mut appender, row + 1, cells, sheet.width, None)?;
                     }
                     appender.flush()?;
@@ -375,7 +416,9 @@ SPU-201,精品挂耳咖啡包,咖啡周边,220,68,14960,2
                         columns,
                         read_note: sheet.note,
                     });
-                }
+                    Ok(())
+                })?;
+                self.check_import_cancelled()?;
                 Ok::<_, AppError>(sheets)
             })();
             match parsed {
@@ -391,7 +434,7 @@ SPU-201,精品挂耳咖啡包,咖啡周边,220,68,14960,2
                         size,
                         imported_at: now(),
                         stored_path: stored.to_string_lossy().into(),
-                        encoding: read.encoding,
+                        encoding,
                         sheets,
                     })
                 }
@@ -500,7 +543,7 @@ SPU-201,精品挂耳咖啡包,咖啡周边,220,68,14960,2
     }
     fn padded_for_sheet(&self,sheet:&SourceSheet)->HashMap<(usize,usize),usize> {
         let path=self.workspace.lock().unwrap().files.iter().find(|f|f.id==sheet.file_id).map(|f|f.stored_path.clone());
-        path.and_then(|p|crate::appearance::padded_cells(Path::new(&p),&sheet.name,sheet.width).ok()).unwrap_or_default()
+        path.and_then(|p|crate::appearance::padded_cells(Path::new(&p),&sheet.name,sheet.width,sheet.rows).ok()).unwrap_or_default()
     }
     pub fn columns_for_source(&self, sheet: &SourceSheet, source: &SourceSelection) -> Result<Vec<Column>> {
         let Some(area) = &source.header_range else { return self.columns_at(sheet, source.header_row); };

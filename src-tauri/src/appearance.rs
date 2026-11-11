@@ -1,7 +1,7 @@
 //! Read presentation metadata only. Values remain in the paged workspace tables.
 use crate::{model::*, reader};
 use quick_xml::{events::Event, Reader};
-use std::{collections::HashMap, fs::File, io::Read, path::Path};
+use std::{collections::HashMap, fs::File, io::{BufReader, Read}, path::Path};
 
 fn attrs(e: &quick_xml::events::BytesStart<'_>, decoder: quick_xml::encoding::Decoder) -> HashMap<String, String> {
     e.attributes().flatten().filter_map(|a| {
@@ -151,8 +151,8 @@ pub fn read(path: &Path, sheet_name: &str, width: usize, offset: usize, limit: u
 pub(crate) fn read_window(path: &Path, sheet: &str, width: usize, offset: usize, limit: usize, column_offset: usize) -> Result<SheetAppearance> {
     read_internal(path,sheet,width,offset,limit,false,column_offset)
 }
-pub(crate) fn padded_cells(path:&Path,sheet_name:&str,width:usize)->Result<HashMap<(usize,usize),usize>> {
-    let look=read_internal(path,sheet_name,width,0,usize::MAX,true,0)?;
+pub(crate) fn padded_cells(path:&Path,sheet_name:&str,width:usize,rows:usize)->Result<HashMap<(usize,usize),usize>> {
+    let look=read_internal(path,sheet_name,width,0,rows,true,0)?;
     Ok(look.cells.iter().filter_map(|c| { let f=&look.styles.get(c.style)?.number_format;
         zero_width(f).map(|n|((c.row,c.column),n))
     }).collect())
@@ -174,12 +174,17 @@ fn read_internal(path: &Path, sheet_name: &str, width: usize, offset: usize, lim
         if !end && tag == "workbookPr" { out.date_1904=a.get("date1904").is_some_and(|v|v=="1"||v=="true"); }
     })?;
     let target = sheet_path(&mut zip, &workbook, sheet_name)?;
-    let sheet_xml = xml(&mut zip, &target)?;
     let theme=theme(&xml(&mut zip,"xl/theme/theme1.xml").unwrap_or_default());
     out.styles = xml(&mut zip, "xl/styles.xml").and_then(|v| styles(&v,&theme)).unwrap_or_else(|_| vec![base_style()]);
-    let mut r=Reader::from_str(&sheet_xml);let mut selected=None::<usize>;let mut numeric=false;let mut in_value=false;
+    let file = zip.by_name(&target).map_err(|e| AppError::new("LAYOUT", e.to_string()))?;
+    let mut r=Reader::from_reader(BufReader::new(file));let mut selected=None::<usize>;let mut numeric=false;let mut in_value=false;
+    let mut buffer=Vec::new();let mut skipped=Vec::new();
+    let end_row=offset.saturating_add(if only_padded {limit} else {limit.min(1000)});
     loop {
-        match r.read_event() {
+        buffer.clear();
+        let event=r.read_event_into(&mut buffer);
+        let start=matches!(&event,Ok(Event::Start(_)));
+        match event {
             Ok(Event::Start(e))|Ok(Event::Empty(e)) => {
                 let name=e.local_name();let tag=String::from_utf8_lossy(name.as_ref());
                 if tag=="v" { in_value=selected.is_some()&&numeric;continue; }
@@ -191,9 +196,18 @@ fn read_internal(path: &Path, sheet_name: &str, width: usize, offset: usize, lim
                         out.default_row_height=a.get("defaultRowHeight").and_then(|v|v.parse::<f64>().ok()).filter(|v|v.is_finite()).map(|v|(v*4./3.).clamp(1.,546.)).unwrap_or(20.);
                         if let Some(w)=a.get("defaultColWidth").and_then(|v|v.parse::<f64>().ok()).filter(|v|v.is_finite()) { out.widths.fill((w*7.+5.).clamp(1.,2500.)); }
                     },
-                    "row" if offset==0 => {
-                        if a.get("hidden").is_some_and(|v|v=="1"||v=="true") { out.row_heights.insert(index(&a,"r"),0.); }
-                        else if let Some(h)=a.get("ht").and_then(|v|v.parse::<f64>().ok()).filter(|v|v.is_finite()) { out.row_heights.insert(index(&a,"r"),(h*4./3.).clamp(1.,546.)); }
+                    "row" => {
+                        let row=index(&a,"r");
+                        if offset==0 {
+                            if a.get("hidden").is_some_and(|v|v=="1"||v=="true") { out.row_heights.insert(row,0.); }
+                            else if let Some(h)=a.get("ht").and_then(|v|v.parse::<f64>().ok()).filter(|v|v.is_finite()) { out.row_heights.insert(row,(h*4./3.).clamp(1.,546.)); }
+                        }
+                        // Keep row heights and the later merge metadata, without decoding off-page cell attributes.
+                        if start && row>0 && (row<=offset || row>end_row) {
+                            skipped.clear();
+                            r.read_to_end_into(e.name(), &mut skipped).map_err(|e|AppError::new("LAYOUT",e.to_string()))?;
+                            selected=None;in_value=false;
+                        }
                     },
                     "col" => {
                         let px=if a.get("hidden").is_some_and(|v|v=="1"||v=="true") { 0. } else { a.get("width").and_then(|v|v.parse::<f64>().ok()).filter(|v|v.is_finite()).map(|v|(v*7.+5.).clamp(1.,2500.)).unwrap_or(64.) };

@@ -57,7 +57,7 @@ fn excel_bounds(size: &mut (usize, usize), position: (u32, u32), max_cells: usiz
 }
 
 /// Filter empty tails before constructing a dense range: a distant blank cell must not allocate the whole Excel grid.
-pub(crate) fn excel_sheet(book: &mut Sheets<BufReader<File>>, path: &Path, name: &str, max_cells: usize) -> Result<(Range<Data>, Range<String>, Option<String>)> {
+fn excel_sheet(book: &mut Sheets<BufReader<File>>, path: &Path, name: &str, max_cells: usize, check: &impl Fn() -> Result<()>) -> Result<(Range<Data>, Range<String>, Option<String>)> {
     let error = |e| AppError::new("SHEET", format!("无法读取工作表“{name}”：{e}"));
     let mut size = (0, 0);
     if let Sheets::Xlsx(xlsx) = book {
@@ -70,7 +70,9 @@ pub(crate) fn excel_sheet(book: &mut Sheets<BufReader<File>>, path: &Path, name:
                 Err(XlsxError::NotAWorksheet(_)) => return Ok((Range::empty(), Range::empty(), None)),
                 Err(e) => return Err(error(e)),
             };
+            let mut count = 0usize;
             while let Some(cell) = cells.next_formula().map_err(error)? {
+                if count % 1024 == 0 { check()?; } count += 1;
                 if !cell.get_value().is_empty() {
                     for table in &mut tables { table.include_data(cell.get_position()); }
                     excel_bounds(&mut size, cell.get_position(), max_cells)?; formulas.push(cell);
@@ -81,7 +83,9 @@ pub(crate) fn excel_sheet(book: &mut Sheets<BufReader<File>>, path: &Path, name:
         let mut values = Vec::new();
         let mut headers = Vec::new();
         let mut cells = xlsx.worksheet_cells_reader(name).map_err(error)?;
+        let mut count = 0usize;
         while let Some(cell) = cells.next_cell().map_err(error)? {
+            if count % 1024 == 0 { check()?; } count += 1;
             let position = cell.get_position();
             let blank = match cell.get_value() { DataRef::Empty => true, DataRef::String(v) => v.trim().is_empty(), DataRef::SharedString(v) => v.trim().is_empty(), _ => false };
             // A cached empty formula result differs from a formula with no saved result.
@@ -113,6 +117,7 @@ pub(crate) fn excel_sheet(book: &mut Sheets<BufReader<File>>, path: &Path, name:
         return Ok((Range::from_sparse(values), formulas, note));
     }
     let values = book.worksheet_range(name).map_err(|e| AppError::new("SHEET", format!("无法读取工作表“{name}”：{e}")))?;
+    check()?;
     let formulas = book.worksheet_formula(name).map_err(|e| AppError::new("SHEET", format!("无法读取工作表“{name}”的公式：{e}")))?;
     let origin = values.start().unwrap_or((0, 0));
     let mut bounds: Option<((u32, u32), (u32, u32))> = None;
@@ -133,39 +138,61 @@ pub(crate) fn excel_sheet(book: &mut Sheets<BufReader<File>>, path: &Path, name:
 }
 
 pub fn read(path: &Path) -> Result<ReadFile> {
+    let mut sheets = Vec::new();
+    let encoding = read_each(path, &|| Ok(()), |sheet| { sheets.push(sheet); Ok(()) })?;
+    Ok(ReadFile { sheets, encoding })
+}
+
+/// Import consumes each sheet before parsing the next one; callers that need a complete workbook can use `read`.
+pub(crate) fn read_each(path: &Path, check: &impl Fn() -> Result<()>, mut consume: impl FnMut(ReadSheet) -> Result<()>) -> Result<Option<String>> {
+    check()?;
     let extension = path
         .extension()
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_lowercase();
     match extension.as_str() {
-        "xlsx" | "xls" => read_excel(path),
-        "csv" => read_csv(path),
+        "xlsx" | "xls" => {
+            let mut book = open_workbook_auto(path)
+                .map_err(|e| AppError::new("EXCEL", format!("Excel 无法读取（可能已损坏或加密）：{e}")))?;
+            let names = book.sheet_names().to_owned();
+            if names.is_empty() { return Err(AppError::new("EMPTY", "工作簿没有工作表")); }
+            for name in names {
+                check()?;
+                consume(read_excel_sheet(&mut book, path, name, check)?)?;
+            }
+            Ok(None)
+        }
+        "csv" => {
+            let read = read_csv(path, check)?;
+            for sheet in read.sheets { check()?; consume(sheet)?; }
+            Ok(read.encoding)
+        }
         _ => Err(AppError::new(
             "UNSUPPORTED",
             "请选择 .xlsx、.xls 或 .csv 文件",
         )),
     }
 }
-fn read_excel(path: &Path) -> Result<ReadFile> {
-    let mut book = open_workbook_auto(path)
-        .map_err(|e| AppError::new("EXCEL", format!("Excel 无法读取（可能已损坏或加密）：{e}")))?;
-    let mut sheets = Vec::new();
-    for name in book.sheet_names().to_owned() {
-        let (range, formulas, note) = excel_sheet(&mut book, path, &name, 20_000_000)?;
+fn read_excel_sheet(book: &mut Sheets<BufReader<File>>, path: &Path, name: String, check: &impl Fn() -> Result<()>) -> Result<ReadSheet> {
+        let (mut range, formulas, note) = excel_sheet(book, path, &name, 20_000_000, check)?;
         let ends = [range.end(), formulas.end()]
             .into_iter()
             .flatten()
             .collect::<Vec<_>>();
         let height = ends.iter().map(|p| p.0 as usize + 1).max().unwrap_or(0);
         let width = ends.iter().map(|p| p.1 as usize + 1).max().unwrap_or(0);
+        let start = range.start().unwrap_or((0, 0));
+        let end = range.end();
         let mut rows = Vec::with_capacity(height);
         for r in 0..height {
+            check()?;
             let mut cells = Vec::with_capacity(width);
             for c in 0..width {
-                let value = range
-                    .get_value((r as u32, c as u32))
-                    .unwrap_or(&Data::Empty);
+                let position = (r as u32, c as u32);
+                let value = if end.is_some_and(|end| position.0 >= start.0 && position.1 >= start.1 && position.0 <= end.0 && position.1 <= end.1) {
+                    std::mem::take(&mut range[(r - start.0 as usize, c - start.1 as usize)])
+                } else { Data::Empty };
                 let cell = match value {
                     Data::Empty => {
                         let has_formula = formulas
@@ -177,16 +204,16 @@ fn read_excel(path: &Path) -> Result<ReadFile> {
                             Cell::Empty
                         }
                     }
-                    Data::String(v) => Cell::Text(v.clone()),
-                    Data::Int(v) => Cell::Number(*v as f64),
-                    Data::Float(v) => Cell::Number(*v),
-                    Data::Bool(v) => Cell::Bool(*v),
+                    Data::String(v) => Cell::Text(v),
+                    Data::Int(v) => Cell::Number(v as f64),
+                    Data::Float(v) => Cell::Number(v),
+                    Data::Bool(v) => Cell::Bool(v),
                     Data::DateTime(v) => v
                         .as_datetime()
                         .map(|d| Cell::Date(d.format("%Y-%m-%d %H:%M:%S").to_string()))
                         .unwrap_or(Cell::Number(v.as_f64())),
-                    Data::DateTimeIso(v) => Cell::Date(v.clone()),
-                    Data::DurationIso(v) => Cell::Text(v.clone()),
+                    Data::DateTimeIso(v) => Cell::Date(v),
+                    Data::DurationIso(v) => Cell::Text(v),
                     Data::Error(v) => Cell::Text(format!("#Excel错误:{v:?}")),
                 };
                 cells.push(cell);
@@ -194,17 +221,9 @@ fn read_excel(path: &Path) -> Result<ReadFile> {
             rows.push(cells);
         }
 
-        sheets.push(ReadSheet { name, rows, width, note });
-    }
-    if sheets.is_empty() {
-        return Err(AppError::new("EMPTY", "工作簿没有工作表"));
-    }
-    Ok(ReadFile {
-        sheets,
-        encoding: None,
-    })
+        Ok(ReadSheet { name, rows, width, note })
 }
-fn read_csv(path: &Path) -> Result<ReadFile> {
+fn read_csv(path: &Path, check: &impl Fn() -> Result<()>) -> Result<ReadFile> {
     let bytes = std::fs::read(path)?;
     let (text, encoding) = if bytes.starts_with(&[0xff, 0xfe]) {
         let (s, _, err) = encoding_rs::UTF_16LE.decode(&bytes[2..]);
@@ -233,6 +252,8 @@ fn read_csv(path: &Path) -> Result<ReadFile> {
         }
         (s.into_owned(), enc.name().into())
     };
+    drop(bytes);
+    check()?;
     let delimiters = [b',', b';', b'\t'];
     let delimiter = delimiters
         .into_iter()
@@ -257,6 +278,7 @@ fn read_csv(path: &Path) -> Result<ReadFile> {
     let mut rows = Vec::new();
     let mut width = 0;
     for row in reader.records() {
+        if rows.len() % 256 == 0 { check()?; }
         let row = row.map_err(|e| AppError::new("CSV", e.to_string()))?;
         width = width.max(row.len());
         rows.push(

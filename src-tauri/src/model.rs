@@ -398,6 +398,16 @@ pub struct ImportItem {
     pub file: Option<SourceFile>,
     pub error: Option<String>,
 }
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportProgress {
+    pub busy: bool,
+    pub done: usize,
+    pub total: usize,
+    pub current: String,
+    pub phase: String,
+    pub cancelled: bool,
+}
 #[derive(Debug, Clone, Serialize, Deserialize, TS, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct DatasetQuery {
@@ -535,6 +545,7 @@ pub fn generate_types(path: &std::path::Path) -> std::io::Result<()> {
         Settings,
         Workspace,
         ImportItem,
+        ImportProgress,
         DatasetQuery,
         Sort,
         Filter,

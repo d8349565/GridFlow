@@ -100,12 +100,22 @@ fn join_error(error: impl std::fmt::Display) -> AppError {
     AppError::new("WORKER", error.to_string())
 }
 #[tauri::command]
-fn workspace(core: Core<'_>) -> Result<Workspace> {
-    core.snapshot()
+async fn workspace(core: Core<'_>) -> Result<Workspace> {
+    let core = core.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || core.snapshot()).await.map_err(join_error)?
 }
 #[tauri::command]
-fn save_draft(core: Core<'_>, rules: RuleSet, active_sheet_id: Option<String>) -> Result<()> {
-    core.save_draft(rules, active_sheet_id)
+async fn save_draft(core: Core<'_>, rules: RuleSet, active_sheet_id: Option<String>) -> Result<()> {
+    let core = core.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || core.save_draft(rules, active_sheet_id)).await.map_err(join_error)?
+}
+#[tauri::command]
+fn import_progress(core: Core<'_>) -> Result<ImportProgress> {
+    core.import_progress()
+}
+#[tauri::command]
+fn cancel_import(core: Core<'_>) -> Result<()> {
+    core.cancel_import()
 }
 #[tauri::command]
 async fn import_files(core: Core<'_>, paths: Vec<String>) -> Result<Vec<ImportItem>> {
@@ -182,9 +192,9 @@ fn cancel_task(core: Core<'_>, task_id: String) -> Result<()> {
     core.cancel(&task_id)
 }
 #[tauri::command]
-fn tasks(core: Core<'_>) -> Result<Vec<Task>> {
-    core.guard()?;
-    Ok(core.snapshot()?.tasks)
+async fn tasks(core: Core<'_>) -> Result<Vec<Task>> {
+    let core = core.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || core.tasks()).await.map_err(join_error)?
 }
 #[tauri::command]
 async fn query_dataset(core: Core<'_>, query: DatasetQuery) -> Result<DataPage> {
@@ -444,6 +454,8 @@ pub fn run() {
             workspace,
             save_draft,
             import_files,
+            import_progress,
+            cancel_import,
             load_sample_files,
             preview_sheet,
             preview_appearance,

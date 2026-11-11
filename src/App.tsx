@@ -94,6 +94,7 @@ import type {
   Task,
   DataPage,
   ImportItem,
+  ImportProgress,
   DatasetQuery,
   PivotSpec,
   Analysis,
@@ -105,6 +106,38 @@ import type {
   SheetRange,
 } from "./types";
 const Chart = lazy(() => import("./Chart"));
+function ImportStatus({ onError }: { onError: (error: unknown) => void }) {
+  const [progress, setProgress] = useState<ImportProgress | null>(null);
+  const [stopping, setStopping] = useState(false);
+  useEffect(() => {
+    let alive = true, started = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const poll = async () => {
+      try {
+        const next = await call<ImportProgress>("import_progress");
+        started ||= next.busy;
+        if (alive && started) setProgress(next);
+      } catch (e) { if (alive) onError(e); return; }
+      if (alive) timer = setTimeout(poll, 200);
+    };
+    void poll();
+    return () => { alive = false; clearTimeout(timer); };
+  }, [onError]);
+  return <>
+    <span className="pulse-dot" />
+    <span className="import-phase">{stopping ? "正在停止，保留已完成文件" : progress?.phase || "正在准备导入"}</span>
+    <span className="import-current" title={progress?.current}>{progress?.current}</span>
+    <div className="progress-track" role="progressbar" aria-label="文件导入进度" aria-valuemin={0}
+      aria-valuemax={progress?.total || 1} aria-valuenow={progress?.done || 0}>
+      <i style={{ width: `${progress?.total ? progress.done * 100 / progress.total : 0}%` }} />
+    </div>
+    <span>{progress ? `${progress.done} / ${progress.total} 个文件` : "准备中"}</span>
+    <Button disabled={!progress?.busy || stopping} onClick={() => {
+      setStopping(true);
+      void call("cancel_import").catch((e) => { setStopping(false); onError(e); });
+    }}>{stopping ? "正在停止" : "取消导入"}</Button>
+  </>;
+}
 const typeNames = {
   auto: "保留原样（默认）",
   text: "文字 / 编号（保留开头的 0）",
@@ -597,7 +630,7 @@ export default function App() {
     };
   }, [modal, suggestHeaders, sourceSignature, reviewAttempt]);
   useEffect(() => {
-    if (!ws || ws.locked) return;
+    if (!ws || ws.locked || busy === "导入文件") return;
     let disposed = false;
     const tick = async () => {
       try {
@@ -645,7 +678,7 @@ export default function App() {
       disposed = true;
       clearInterval(timer);
     };
-  }, [ws?.locked, ws?.datasets.length, !!running]);
+  }, [ws?.locked, ws?.datasets.length, !!running, busy === "导入文件"]);
   useEffect(() => {
     if (!isTauri()) return;
     let stop: (() => void) | undefined;
@@ -722,6 +755,7 @@ export default function App() {
     await action("导入文件", async () => {
       await call("save_draft", { rules: latestRules.current, activeSheetId: latestActive.current });
       const report = await call<ImportItem[]>("import_files", { paths });
+      const importState = await call<ImportProgress>("import_progress");
       setImportReport(report);
       const value = await refresh();
       const added = new Set(
@@ -737,7 +771,9 @@ export default function App() {
       if (report.some((item) => item.error)) setModal("imports");
       else {
         setModal(null);
-        setNotice({ message: `已添加 ${report.length} 个文件，并勾选其中的工作表。`, error: false });
+        setNotice({ message: importState.cancelled
+          ? `已停止导入，保留已完成的 ${report.length} 个文件。未完成的文件未加入，可继续添加。`
+          : `已添加 ${report.length} 个文件，并勾选其中的工作表。`, error: false });
         if (!localStorage.getItem("gridflow_tour_completed")) {
           setTourStep(0);
           setTourActive(true);
@@ -2201,7 +2237,7 @@ export default function App() {
       </div>
       <footer className="task-tray">
         <div className="task-tray-status">
-          {running ? (
+          {busy === "导入文件" ? <ImportStatus onError={error} /> : running ? (
             <>
               <span className="pulse-dot" />
               <b>{taskNames[running.state]}</b>
