@@ -553,7 +553,7 @@ pub fn generate_types(path: &std::path::Path) -> std::io::Result<()> {
         PivotSpec,
         Analysis,
         AppError,
-        RenameCell, RenameArea, RenameCondition, RenameLookupEntry, RenamePart,
+        RenameCell, RenameArea, RenameCondition, RenameLookupEntry, RenameLookupTable, RenamePart,
         RenameSum, RenameCheck, RenameRules, RenameFile, RenameScan, RenamePage,
         RenameRow, RenamePlan, RenameProgress, RenamePreset, RenamePresetSummary, RenameOutput, RenameOutputMode
     );

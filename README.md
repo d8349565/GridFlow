@@ -2,7 +2,7 @@
 
 > **汇格（GridFlow）** 是一款面向 Windows 桌面端的专业本地表格合并与分析工具：专为日常办公中繁重复杂的多表汇总需求设计，无需编写脚本或复杂公式，通过可视化直观操作，将分散、异构的多份 Excel / CSV 快速合并为规范母表，并直接在本地完成数据清洗、多维汇总统计与图表分析。全部计算与存储均在本机离线完成，商业数据零泄露。
 
-[![Release](https://img.shields.io/badge/Release-v2.2.0-blue.svg)](https://github.com/d8349565/GridFlow/releases)
+[![Release](https://img.shields.io/badge/Release-v2.3.0-blue.svg)](https://github.com/d8349565/GridFlow/releases)
 [![Download](https://img.shields.io/badge/Download-Releases-orange.svg)](https://github.com/d8349565/GridFlow/releases)
 [![Platform](https://img.shields.io/badge/Platform-Windows%2010%20%7C%2011%20x64-0078d4.svg)](#下载与使用-installation)
 [![Data Privacy](https://img.shields.io/badge/Privacy-100%25%20Local%20%26%20Offline-success.svg)](#数据存储与安全-configuration--privacy)
@@ -17,7 +17,7 @@
 
 软件开箱即用，无需预装 Python、Node.js 或数据库服务：
 
-1. 前往 [Releases 下载页](https://github.com/d8349565/GridFlow/releases) 下载最新发行包 `GridFlow-v2.2.0-win-x64-*.zip`；
+1. 前往 [Releases 下载页](https://github.com/d8349565/GridFlow/releases) 下载最新发行包 `GridFlow-v2.3.0-win-x64-*.zip`；
 2. 解压到本地任意目录（保持同级目录自带的 `duckdb.dll` 不被移动或删除）；
 3. 双击 `GridFlow.exe` 即可直接运行。
 
@@ -34,10 +34,10 @@
    - 在原表区域鼠标划选表头行（支持单行、多行复合表头与合并单元格），点击「设为表头」；
    - 点选单据头部独立单元格（如“填报门店”、“所属月份”），点击「添加为新列」自动提取为整表维度。
 3. **预览结果与导出**：
-   - 点击顶部「预览结果」（或快捷键 `Ctrl + Enter`），引擎毫秒级合并所有文件；
+   - 点击「生成汇总结果」（或快捷键 `Ctrl + Enter`），后台合并文件并显示进度；也可先检查每张来源表前 200 行的样本；
    - 在结果页核对明细、按条件筛选过滤、分类汇总统计，一键导出为标准 XLSX、CSV 或统计图表图片。
 
-**预期效果**：即时呈现清洗对齐后的单张大表，源文件分毫不变；十万行明细翻页延迟低于 30ms。
+**预期效果**：生成清洗对齐后的汇总表，保留来源信息，原文件保持不变。处理时间取决于文件规模、格式与本机配置，批量导入和汇总提供进度及取消入口。
 
 <img src="docs/assets/主页.png" alt="汇格 · GridFlow 主页" style="zoom: 50%;" />
 
@@ -52,11 +52,11 @@
 
 ## 核心能力 (Features)
 
-v2.2.0 新增独立的「批量重命名」入口：在 Excel 预览中点选命名内容，按需添加编码对照、金额/数量校验和条件标签，实时预览后确认执行，支持集中复制或移动到一个文件夹、本机命名配置库，并可导出日志或撤销。跨电脑使用命名配置时，通过密码加密的配置文件导出、导入。详见[操作与验证说明](docs/rename.md)。
+在「批量重命名」中，可以点选 Excel 单元格组合文件名，按需加入对照取值、金额或数量校验及条件标签。v2.3.0 支持在同一配置中复用多列对照表，各命名项可以选择自己的匹配列和取值列。核对后可在原处改名，或集中复制、移动到一个文件夹。支持处理日志、撤销和加密配置导入导出。详见[操作与验证说明](docs/rename.md)。
 
 - **高保真原表还原** — 深度兼容 Excel 原生样式，保留字体、字号、颜色、对齐、边框、合并单元格及隐藏行列，保留视觉上下文，不修改用户原始文件。
 - **复合表头与固定信息智能抽取** — 轻松处理多层合并表头，并能将孤立单元格（门店、日期、部门等）一键平铺为新增数据列。
-- **十万级本地秒级运算引擎** — 采用 Rust 内核结合 DuckDB 列式引擎，10 万行报表合并不到 2 秒，筛选延迟低于 10ms，峰值工作集仅约 170MB，告别 Excel 卡顿假死。
+- **本地数据处理引擎** — 采用 Rust 内核结合 DuckDB 列式引擎，支持批量汇总、分页预览和本地分析。v2.3.0 减少导入及汇总期间的重复状态保存；历史性能基线与适用范围见[验证记录](docs/validation.md)，不保证所有文件具有固定耗时。
 - **智能格式清洗与异常容错** — 文本型数字前导零（如工号 `0089`）完整保留；混合日期与数值自适应识别；遇到转换异常时保留原始值并精准标明源文件与行列坐标。
 - **多维汇总透视与动态图表** — 内置分组聚合（求和、均值、计数、极值）、透视分析及柱状/折线/饼图/散点图联动，无需切回 Excel 繁琐重拉透视表。
 - **配置自动留存与方案复用** — 规则修改实时自动草稿保存，支持多步撤销/重做（`Ctrl+Z` / `Ctrl+Y`）；常用业务规则可保存为方案模板，往后同类报表一键套用。
@@ -124,7 +124,7 @@ npm run test:ui     # 执行 Playwright 界面自动化契约测试
 # 构建便携发布包（也可直接双击根目录「一键打包.bat」或运行 package.bat）
 npm run release
 ```
-打包完成后将在 `release/` 目录生成带有 SHA-256 校验的 `GridFlow-v2.2.0-win-x64-*.zip` 便携包与 `latest.json` 元数据文件。
+打包完成后将在 `release/` 目录生成带有 SHA-256 校验的 `GridFlow-v2.3.0-win-x64-*.zip` 便携包与 `latest.json` 元数据文件。
 
 十万行、二十列基准测试：
 ```powershell

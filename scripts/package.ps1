@@ -20,6 +20,7 @@ try {
     Copy-Item -LiteralPath 'src-tauri/target/release/excel-workbench.exe' -Destination (Join-Path $taskDirectory 'GridFlow.exe')
     Copy-Item -LiteralPath '.tools/duckdb/duckdb.dll' -Destination $taskDirectory
     Copy-Item -LiteralPath 'README.md' -Destination $taskDirectory
+    Copy-Item -LiteralPath 'CHANGELOG.md','LICENSE' -Destination $taskDirectory
     Copy-Item -LiteralPath 'THIRD_PARTY_NOTICES.md' -Destination $taskDirectory
     & (Join-Path $PSScriptRoot 'licenses.ps1') | Out-Null
     Copy-Item -LiteralPath (Join-Path $taskReleaseRoot 'licenses') -Destination $taskDirectory -Recurse

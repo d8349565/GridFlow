@@ -1,12 +1,11 @@
-import { useEffect, useRef, useState, type Ref } from "react";
-import { ArrowDown, ArrowUp, MousePointer2, Plus, X } from "lucide-react";
+import type { Ref } from "react";
+import { ArrowDown, ArrowUp, MousePointer2, Plus, Table2, X } from "lucide-react";
 import { Button } from "./components";
 import { coordinate } from "./api";
 import { rangeLabel } from "./ExcelPreview";
-import { parseLookupTable } from "./renameTable";
 import type { RenameCell, RenameCheck, RenameCondition, RenamePart, RenameRow, RenameRules, RenameSum } from "./types";
 
-export type PickTarget = { kind: "tag"; part?: number } | { kind: "expected"; check?: number } | { kind: "sum"; check: number; sum?: number } | { kind: "sumCondition"; check: number; sum: number };
+export type PickTarget = { kind: "tag"; part?: number } | { kind: "lookup"; part: number } | { kind: "expected"; check?: number } | { kind: "sum"; check: number; sum?: number } | { kind: "sumCondition"; check: number; sum: number };
 
 function Location({ sheet, address }: { sheet: string; address: string }) {
   return <span className="rename-source-location"><span className="rename-source-sheet">{sheet}</span><span className="rename-source-address">{address}</span></span>;
@@ -26,30 +25,15 @@ function ConditionFields({ value, onChange, onPick }: { value: RenameCondition; 
     {value.operator === "equals" && <label className="rename-field">比较内容<input aria-label="条件值" value={value.value} onChange={e => onChange({ ...value, value:e.target.value })} /></label>}
   </div>;
 }
-function LookupRows({ part, onChange }: { part: Extract<RenamePart, { kind:"lookup" }>; onChange: (part: RenamePart) => void }) {
-  const asText=() => part.entries.map(e => [e.key,e.value].map(v => /[\t\r\n"]/.test(v) ? `"${v.replaceAll('"','""')}"` : v).join("\t")).join("\n");
-  const [draft,setDraft]=useState(asText);
-  const lastEntries=useRef(part.entries);
-  useEffect(() => { if(part.entries !== lastEntries.current) { lastEntries.current=part.entries; setDraft(asText()); } },[part.entries]);
-  const parsed=parseLookupTable(draft);
-  return <details className="rename-advanced"><summary>对照表 · {part.entries.length} 行</summary><div className="rename-advanced-body">
-    <textarea aria-label="对照表，两列用制表符分隔" rows={5} value={draft} onChange={e => {
-      setDraft(e.target.value); const table=parseLookupTable(e.target.value);
-      const entries=table.error ? [] : table.rows.map(row => ({ key:row[0] ?? "", value:row.length === 2 ? row[1] : "" }));
-      lastEntries.current=entries; onChange({ ...part,entries });
-    }} />
-    {parsed.error && <small className="rename-invalid">{parsed.error}</small>}
-    <label className="rename-field">找不到对照时<input placeholder="留空则跳过该文件" value={part.fallback ?? ""} onChange={e => onChange({ ...part,fallback:e.target.value || null })} /></label>
-  </div></details>;
-}
 const purposes: Record<RenamePart["kind"],string> = {
-  cell:"取出每份文件相同位置的内容。", lookup:"用单元格里的编码，查找对应信息。",
+  cell:"取出每份文件相同位置的内容。", lookup:"从对照表取值。", tableLookup:"在对照表找到对应行后取值。",
   text:"这段文字会原样加入文件名。", condition:"满足条件时，才把标签加入文件名。",
 };
 
-export default function RenameRulesPanel({ rules, live, livePending, busy, picking, ready, editorRef, onChange, onPick, onReset }: {
+export default function RenameRulesPanel({ rules, live, livePending, busy, picking, ready, editorRef, onChange, onPick, onEditLookup, onManageLookups, onReset }: {
   rules:RenameRules; live:RenameRow | null; livePending:boolean; busy:boolean; picking:boolean; ready:boolean;
-  editorRef:Ref<HTMLElement>; onChange:(rules:RenameRules) => void; onPick:(target:PickTarget) => void; onReset:() => void;
+  editorRef:Ref<HTMLElement>; onChange:(rules:RenameRules) => void; onPick:(target:PickTarget) => void;
+  onEditLookup:(index:number,source:RenameCell) => void; onManageLookups:() => void; onReset:() => void;
 }) {
   const disabled=busy || picking || !ready;
   const setPart=(index:number,part:RenamePart) => onChange({ ...rules,parts:rules.parts.map((p,i) => i === index ? part : p) });
@@ -61,32 +45,41 @@ export default function RenameRulesPanel({ rules, live, livePending, busy, picki
     const parts=[...rules.parts]; [parts[index],parts[index+direction]]=[parts[index+direction],parts[index]]; onChange({ ...rules,parts });
   }
   return <aside ref={editorRef} id="rename-rules-panel" className="rename-editor">
-    <header className="rename-editor-heading"><div><h2>命名规则</h2><small>设置内容，立即查看新文件名</small></div><Button className="quiet" disabled={disabled || (!rules.parts.length && !rules.checks.length)} onClick={onReset}>清空规则</Button></header>
+    <header className="rename-editor-heading"><div><h2>组成文件名</h2><small>先添加内容，再调整顺序和格式</small></div><Button className="quiet" disabled={disabled || (!rules.parts.length && !rules.checks.length)} onClick={onReset}>清空规则</Button></header>
     <div className="rename-editor-scroll"><fieldset disabled={disabled}>
-      <section className="rename-builder-section" aria-labelledby="rename-format-heading"><h3 id="rename-format-heading">文件名格式</h3>
-        <div className="rename-affixes"><label>前缀<input value={rules.prefix} onChange={e => onChange({ ...rules,prefix:e.target.value })} /></label><label>分隔符<input value={rules.separator} onChange={e => onChange({ ...rules,separator:e.target.value })} /></label><label>后缀<input placeholder="如：万元" value={rules.suffix} onChange={e => onChange({ ...rules,suffix:e.target.value })} /></label></div>
-        <small className="rename-field-help">原文件扩展名自动保留。</small>
-      </section>
-      <section className="rename-builder-section" aria-labelledby="rename-parts-heading"><div className="rename-section-heading"><h3 id="rename-parts-heading">文件名组成</h3><span>{rules.parts.length} 项</span></div><p className="rename-section-purpose">下面的内容会从上到下依次拼接。可在预览上选单元格，再加入文件名或添加对照。</p>
+      <section className="rename-builder-section" aria-labelledby="rename-parts-heading">
+        <div className="rename-section-heading rename-parts-heading"><h3 id="rename-parts-heading">文件名组成</h3><span>{rules.parts.length} 项</span><Button className="quiet" icon={Table2} onClick={onManageLookups}>管理对照表</Button></div>
+        <p className="rename-section-purpose">下面的内容会从上到下依次拼接。点选原表单元格，可直接使用原值或从对照表取值。</p>
         <ol className="rename-parts">{rules.parts.map((part,index) => {
           const value=live?.values[index];
           const omitted=part.kind === "condition" && value === "";
           const preview=livePending ? "正在更新…" : value !== undefined ? value || (omitted ? "不加入（条件不满足）" : "空白") : live ? "暂无法取值" : "等待预览";
-          const title=part.kind === "cell" ? "单元格内容" : part.kind === "lookup" ? part.name || "对照信息" : part.kind === "condition" ? "条件标签" : "固定文字";
+          const title=part.kind === "cell" ? "单元格内容" : part.kind === "tableLookup" ? part.valueColumn : part.kind === "lookup" ? part.name || "对照取值" : part.kind === "condition" ? "条件标签" : "固定文字";
+          const table = part.kind === "tableLookup" ? rules.lookupTables.find(table => table.id === part.tableId) : undefined;
           return <li key={index} className="rename-rule-card"><div className="rename-rule-header"><div className="rename-rule-heading"><span className="rename-rule-order">{index+1}</span><h4>{title}</h4></div><div className="rename-rule-actions">
             <Button className="quiet icon-button" aria-label={`上移第 ${index+1} 项`} title="上移" icon={ArrowUp} disabled={!index} onClick={() => movePart(index,-1)} /><Button className="quiet icon-button" aria-label={`下移第 ${index+1} 项`} title="下移" icon={ArrowDown} disabled={index === rules.parts.length-1} onClick={() => movePart(index,1)} /><Button className="quiet icon-button" icon={X} title="移除此命名项" aria-label={`移除第 ${index+1} 项`} onClick={() => onChange({ ...rules,parts:rules.parts.filter((_,i) => i !== index) })} />
           </div></div><p className="rename-rule-purpose">{purposes[part.kind]}</p><div className="rename-rule-fields">
-            {(part.kind === "cell" || part.kind === "lookup") && <div className="rename-field"><span>{part.kind === "lookup" ? "编码取值位置" : "取值位置"}</span><CellLocation source={part.source} /></div>}
+            {part.kind === "cell" && <div className="rename-field"><span>取值位置</span><CellLocation source={part.source} /></div>}
+            {part.kind === "tableLookup" && <>
+              <div className="rename-field"><span>用于查找的单元格</span><SourcePicker sheet={part.source.sheet} address={coordinate(part.source.row, part.source.column)} purpose="重新选择用于查找的单元格" onPick={() => onPick({ kind: "lookup", part: index })} /></div>
+              <div className="rename-source-readonly rename-lookup-rule"><strong>{table?.name ?? "对照表已缺失"}</strong><small>{part.matchColumn} → {part.valueColumn}</small></div>
+              <Button className="rename-add-action" onClick={() => onEditLookup(index, part.source)}>修改取值规则</Button>
+            </>}
             {part.kind === "cell" && <label className="rename-inline">数字格式<select aria-label={`第 ${index+1} 项数字格式`} value={part.decimals === null ? "raw" : part.decimals} onChange={e => setPart(index,{ ...part,decimals:e.target.value === "raw" ? null : Number(e.target.value) })}><option value="raw">保留原值</option><option value="0">整数</option><option value="1">1 位小数</option><option value="2">2 位小数</option><option value="4">4 位小数</option></select></label>}
             {(part.kind === "text" || part.kind === "condition") && <label className="rename-field">{part.kind === "condition" ? "加入的标签" : "加入的文字"}<input aria-label={part.kind === "condition" ? "条件标签文字" : "固定文字"} value={part.text} onChange={e => setPart(index,{ ...part,text:e.target.value })} /></label>}
             {part.kind === "condition" && <ConditionFields value={part.condition} onPick={() => onPick({kind:"tag",part:index})} onChange={condition => setPart(index,{ ...part,condition })} />}
-            {part.kind === "lookup" && <LookupRows key={`${index}:${JSON.stringify(part.source)}`} part={part} onChange={next => setPart(index,next)} />}
           </div><div className={`rename-rule-result ${omitted ? "is-omitted" : ""}`}><span>本文件将加入</span><strong>{preview}</strong></div></li>;
         })}</ol>
         {!rules.parts.length && <div className="rename-empty-guide">先在原表中选择内容，再点击“加入文件名”。也可以添加一段固定文字。</div>}
         <Button className="rename-add-action" icon={Plus} onClick={() => onChange({ ...rules,parts:[...rules.parts,{kind:"text",text:""}] })}>添加固定文字</Button>
       </section>
-      <section className="rename-builder-section rename-checks" aria-labelledby="rename-checks-heading"><div className="rename-section-heading"><h3 id="rename-checks-heading">内容校验</h3><span>可选</span></div><p className="rename-section-purpose">核对填写值和明细合计；不一致时，在文件名前加入异常标记。</p>
+      <details className="rename-builder-section rename-options">
+        <summary>分隔符与前后缀<span>{rules.prefix || rules.suffix || rules.separator !== "_" ? "已自定义" : "可选"}</span></summary>
+        <div className="rename-affixes"><label>前缀<input placeholder="如：月报" value={rules.prefix} onChange={e => onChange({ ...rules,prefix:e.target.value })} /></label><label>分隔符<input value={rules.separator} onChange={e => onChange({ ...rules,separator:e.target.value })} /></label><label>后缀<input placeholder="如：万元" value={rules.suffix} onChange={e => onChange({ ...rules,suffix:e.target.value })} /></label></div>
+        <small className="rename-field-help">默认用下划线连接各项；原文件扩展名自动保留。</small>
+      </details>
+      <details className="rename-builder-section rename-options rename-checks" open={!!rules.checks.length}>
+        <summary>内容校验<span>{rules.checks.length ? `${rules.checks.length} 项` : "可选"}</span></summary><p className="rename-section-purpose">核对填写值和明细合计；不一致时，在文件名前加入异常标记。</p>
         {rules.checks.map((check,i) => {
           const raw=live?.checks[i], prefix=`${check.label}：`;
           const result=raw?.startsWith(prefix) ? raw.slice(prefix.length) : raw;
@@ -106,7 +99,7 @@ export default function RenameRulesPanel({ rules, live, livePending, busy, picki
           </div><div className={`rename-check-result ${result?.startsWith("不一致") ? "is-warning" : result ? "is-passed" : ""}`}><span>本文件校验结果</span><p title="显示保留两位小数，校验使用原始精度。">{livePending ? "正在核对…" : result || "选择填写值和合计区域后显示结果"}</p></div></div>;
         })}
         {!rules.checks.length && <div className="rename-empty-guide"><p>需要检查金额或数量时，先添加校验，再到原表选择填写值和明细。</p><Button icon={Plus} onClick={() => onPick({kind:"expected"})}>添加校验规则</Button></div>}
-      </section>
+      </details>
     </fieldset></div>
   </aside>;
 }

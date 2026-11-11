@@ -71,6 +71,7 @@ import RenameWorkbench, { type RenameSession } from "./RenameWorkbench";
 import { activeOutputs, applyFirstFileSettings, editConfiguration, executionRules, fileEnabled, mergeMode, removeOutputColumn, syncGroups, syncOutputSources, outputError, templateFile, templateProblems } from "./summary";
 import OnboardingTour from "./OnboardingTour";
 import HelpModal from "./HelpModal";
+import WorkflowBar from "./WorkflowBar";
 import {
   call,
   chooseFiles,
@@ -862,7 +863,7 @@ export default function App() {
       await refresh();
       setModal(null);
       setNotice({
-        message: `已保存「${scheme.name}」。下次添加同类文件后，可在「配置文件」中选它。`,
+        message: `已保存「${scheme.name}」。下次添加同类文件后，可在「保存 / 套用规则」中选它。`,
         error: false,
       });
     });
@@ -960,11 +961,7 @@ export default function App() {
   function goHome() {
     setModal(null);
     setTourActive(false);
-    if (isHome && ws?.files.length) {
-      confirmResetToInitial();
-    } else {
-      setHomeView(true);
-    }
+    setHomeView(true);
   }
   function confirmResetToInitial() {
     const fileCount = ws?.files.length ?? 0;
@@ -1027,7 +1024,7 @@ export default function App() {
     edit(() => next);
     setModal(null);
     setNotice({
-      message: "已使用所选调整。可以查看合并预览，或直接合并全部数据。",
+      message: "已使用所选调整。可以检查合并样本，或直接生成完整汇总结果。",
       error: false,
     });
     if (merge) void generate(editConfiguration(allRules, files, activeOutput, () => next));
@@ -1268,39 +1265,31 @@ export default function App() {
   return (
     <div className="app-shell">
       <header className="app-header">
-        <div
+        <button
           className="brand"
-          role="button"
-          tabIndex={0}
-          title="回到主页（初始页面状态）"
+          type="button"
+          title="回到主页，保留当前工作"
           onClick={goHome}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" || e.key === " ") goHome();
-          }}
         >
           <div className="app-mark">
             <FileSpreadsheet size={18} />
           </div>
           <strong>汇格 · GridFlow</strong>
-        </div>
-        <nav className="module-nav" aria-label="工具入口"><button className="active" aria-current="page">Excel 汇总</button><button disabled={!!busy || !!running || !ws} onClick={() => { setTourActive(false); setModal(null); setTool("rename"); }}>批量重命名</button></nav>
-        {!!(ws?.files.length || ws?.datasets.length) && <nav className="stage-nav" aria-label="汇总步骤">
-          <button className={phase === "configure" && !isHome ? "active" : ""} aria-current={phase === "configure" && !isHome ? "step" : undefined} aria-label={phase === "results" ? "返回修改配置" : undefined} title="配置表头、输出列与整理方式" onClick={returnToConfig}><span aria-hidden="true">1</span>配置汇总内容</button>
-          <button className={phase === "results" && !isHome ? "active" : ""} aria-current={phase === "results" && !isHome ? "step" : undefined} disabled={!ws?.datasets.length && !running} onClick={() => { setHomeView(false); setPhase("results");setTab("result"); }}><span aria-hidden="true">2</span>预览与保存</button>
-        </nav>}
+        </button>
+        <nav className="module-nav" aria-label="工具入口"><button className={!isHome ? "active" : ""} aria-current={!isHome ? "page" : undefined} onClick={returnToConfig}>Excel 汇总</button><button disabled={!!busy || !!running || !ws} onClick={() => { setTourActive(false); setModal(null); setTool("rename"); }}>批量重命名</button></nav>
         <div className="header-actions">
           {phase === "configure" && !!ws?.files.length && !isHome && <>
             <div className="edit-actions">
               <Button className="quiet icon-button" icon={Undo2} aria-label="撤销配置修改" title="撤销上一次调整" disabled={!rulesState.past.length} onClick={() => dispatch({ kind:"undo" })} />
               <Button className="quiet icon-button" icon={Redo2} aria-label="重做配置修改" title="恢复撤销的调整" disabled={!rulesState.future.length} onClick={() => dispatch({ kind:"redo" })} />
             </div>
-            <Button className="quiet" icon={Save} disabled={!selectedFiles.length} title="保存或套用汇总配置文件" onClick={() => setModal("reuse")}>配置文件</Button>
+            <Button className="quiet" icon={Save} disabled={!selectedFiles.length} title="保存本次规则，或使用之前保存的规则" onClick={() => setModal("reuse")}>保存 / 套用规则</Button>
           </>}
           <Button
             className={`quiet icon-button ${isHome ? "selected" : ""}`}
             icon={Home}
             aria-label="回到主页"
-            title={isHome && ws?.files.length ? "已在主页（点击可清空并恢复初始状态）" : "回到主页（初始页面状态）"}
+            title="回到主页，保留当前工作"
             onClick={goHome}
           />
           <Button className="quiet history-button" icon={History} onClick={() => setModal("history")}>
@@ -1310,14 +1299,27 @@ export default function App() {
           <Button className="quiet icon-button" icon={Settings} aria-label="设置" title="设置" onClick={() => {
             setModal("settings");void call<number>("disk_usage").then(setDisk).catch(error);
           }} />
-          {phase === "configure" && !!ws?.files.length && !isHome ? <Button data-tour="preview-btn" icon={Play} primary disabled={!hasSources || !!outputProblem || !!busy} title={outputProblem || undefined} loading={busy === "提交任务"} onClick={() => void generate()}>生成汇总结果</Button>
-            : phase === "results" && !isHome && tab !== "pivot" && tab !== "chart" ? <>
+        </div>
+      </header>
+      {!isHome && <WorkflowBar label="汇总步骤" current={phase === "results" ? 2 : hasSources ? 1 : 0}
+        steps={[
+          { label: "选择文件", onClick: () => { returnToConfig(); setPanels((old) => ({ ...old, files: true })); } },
+          { label: "确认汇总内容", onClick: () => { returnToConfig(); setPanels((old) => ({ ...old, rules: true })); } },
+          { label: "查看并保存", disabled: !ws?.datasets.length && !running, onClick: () => { setPhase("results"); setTab("result"); } },
+        ]}
+        hint={busy ? `正在${busy}，请稍候。` : running ? "正在生成完整结果，完成后会自动显示。" : phase === "configure"
+          ? !selectedFiles.length ? "先在左侧启用需要处理的文件。" : !hasSources ? "下一步：展开左侧文件，勾选需要汇总的工作表。"
+            : outputProblem || `已选 ${selectedFiles.length} 个文件 · 下一步：确认表头和需要保留的列，再生成汇总结果。`
+          : staleResult ? "配置已修改，请先刷新结果，再保存新版本。"
+            : tab === "preview" ? "这里是每张来源表前 200 行的样本；完整数据请查看「汇总表」。"
+              : tab === "pivot" || tab === "chart" ? "按需选择分类和统计内容，再点击「计算统计」。"
+                : dataset ? "结果已生成。核对下方内容后，点击「保存到电脑」导出文件。" : "还没有可查看的结果，请返回「确认汇总内容」生成。"}
+        actions={phase === "configure" ? <Button data-tour="preview-btn" icon={Play} primary disabled={!hasSources || !!outputProblem || !!busy || !!running} title={outputProblem || undefined} loading={busy === "提交任务"} onClick={() => void generate()}>生成汇总结果</Button>
+            : tab !== "pivot" && tab !== "chart" ? <>
               {staleResult && <Button icon={RefreshCw} primary disabled={!!busy || !hasSources || !!outputProblem} onClick={() => void generate()}>按当前配置刷新结果</Button>}
               <select aria-label="导出格式" value={exportFormat} onChange={(e) => setExportFormat(e.target.value)}><option value="xlsx">Excel</option><option value="csv">CSV</option></select>
               <Button icon={Download} primary={!staleResult} disabled={!dataset || !!busy} loading={busy === "导出" || busy === "导出多表 Excel"} onClick={() => void (tab !== "preview" && exportFormat === "xlsx" && resultSetIds.length > 1 && !query.filters.length && !query.search ? exportWorkbook(resultSetIds) : exportCurrent())}>{query.filters.length || query.search ? "保存筛选后的表格" : tab !== "preview" && exportFormat === "xlsx" && resultSetIds.length > 1 ? `保存全部 ${resultSetIds.length} 张表到 Excel` : staleResult ? "保存此版本" : "保存到电脑"}</Button>
-            </> : null}
-        </div>
-      </header>
+            </> : null} />}
       {notice && !modal && <div className={`workspace-notice ${notice.error ? "persistent" : ""}`}>{noticeBox}</div>}
       <div
         className={`workspace ${isResizingSidebar ? "is-resizing" : ""} ${isHome ? "files-hidden rules-hidden" : phase === "results" ? "results-workspace" : `${!ws?.files.length || !panels.files ? "files-hidden" : ""} ${!ws?.files.length || !panels.rules ? "rules-hidden" : ""}`}`}
@@ -1342,7 +1344,7 @@ export default function App() {
                     fileSelections: files.map((f) => ({ fileId: f.id, enabled })),
                   }));
               }} />
-              <span>文件 <b>{ws?.files.length ?? 0}</b></span>
+              <span>来源文件 <b>{ws?.files.length ?? 0}</b></span>
             </label>
             {selectedFiles.length > 0 && (
               <button
@@ -1400,8 +1402,8 @@ export default function App() {
         <main className="main-pane">
           {phase === "results" && !isHome && <div className="result-toolbar"><div className="pane-tabs">
             {[
-              { id: "preview", name: "合并预览", Icon: MousePointer2 },
               { id: "result", name: "汇总表", Icon: Layers },
+              { id: "preview", name: "样本预览", Icon: MousePointer2 },
               { id: "pivot", name: "分类统计", Icon: Table2 },
               { id: "chart", name: "图表", Icon: BarChart3 },
             ].map(({ id, name, Icon }) => (
@@ -1446,34 +1448,37 @@ export default function App() {
                     <span>当前工作区已导入 <b>{ws.files.length}</b> 个文件（{selectedSheets} 张表已选）</span>
                   </div>
                   <div className="session-actions">
-                    <Button primary onClick={() => setHomeView(false)}>继续配置汇总</Button>
+                    <Button primary onClick={returnToConfig}>继续配置汇总</Button>
                     <Button danger icon={RotateCcw} onClick={confirmResetToInitial}>清空并重置</Button>
                   </div>
                 </div>
               )}
-              <div className="welcome-icon">
-                <FileSpreadsheet size={28} />
+              <div className="welcome-heading"><span className="welcome-kicker">汇格 · 本地表格工具</span>
+                <h1>今天要处理什么？</h1>
+                <p>选一个任务开始。文件和处理结果都保存在本机。</p>
               </div>
-              <h1>
-                把多份表格，合成一份 Excel。
-              </h1>
-              <p>
-                添加文件，在 Excel 预览上选好表头和附加信息。
-                <br />
-                内容只在本机处理，原文件保持原样。
-              </p>
-              <div className="welcome-actions">
-                <Button
-                  icon={Plus}
-                  primary
-                  disabled={!!busy}
-                  onClick={() => void importChoose()}
-                >
-                  添加文件
-                </Button>
-                <Button className="quiet" icon={FolderOpen} disabled={!!busy} onClick={() => void importChoose(true, true)}>从多个文件夹添加</Button>
-                <Button icon={Sparkles} disabled={!!busy} loading={busy === "载入示例数据"} onClick={() => void loadSample()}>体验示例数据（2份连锁门店月报）</Button>
-                <Button className="quiet" icon={BookOpen} onClick={() => setModal("help")}>快速上手教程</Button>
+              <div className="task-choices">
+                <section className="task-choice">
+                  <div className="task-choice-icon"><Layers size={24} aria-hidden="true" /></div>
+                  <h2>汇总表格</h2>
+                  <p>把多份 Excel / CSV 的数据合在一起，生成可筛选、可统计的汇总表。</p>
+                  <ol className="task-choice-steps"><li>添加来源文件</li><li>确认表头与列</li><li>生成并保存</li></ol>
+                  <div className="task-choice-actions">
+                    <Button icon={Plus} primary disabled={!!busy || !ws} onClick={() => void importChoose()}>添加文件，开始汇总</Button>
+                    <Button className="quiet" icon={FolderOpen} disabled={!!busy || !ws} onClick={() => void importChoose(true, true)}>从文件夹添加</Button>
+                    <small>原文件保持原样，另存汇总结果</small>
+                  </div>
+                </section>
+                <section className="task-choice">
+                  <div className="task-choice-icon"><Pencil size={24} aria-hidden="true" /></div>
+                  <h2>批量改文件名</h2>
+                  <p>用表内的门店、日期等内容组成文件名，先核对，再统一改名或集中存放。</p>
+                  <ol className="task-choice-steps"><li>添加待改名文件</li><li>组成新文件名</li><li>核对后执行</li></ol>
+                  <div className="task-choice-actions">
+                    <Button icon={ArrowRight} disabled={!!busy || !!running || !ws} onClick={() => { setTourActive(false); setModal(null); setTool("rename"); }}>开始批量重命名</Button>
+                    <small>表格内容保持原样</small>
+                  </div>
+                </section>
               </div>
               <div className="welcome-formats">
                 <span>XLSX</span>
@@ -1481,18 +1486,9 @@ export default function App() {
                 <span>CSV</span>
                 <small>单文件 100MB · 每批 500MB</small>
               </div>
-              <div className="welcome-steps">
-                <span>
-                  <b>1</b>添加文件
-                </span>
-                <ArrowRight size={15} />
-                <span>
-                  <b>2</b>配置表头与新列
-                </span>
-                <ArrowRight size={15} />
-                <span>
-                  <b>3</b>预览并保存
-                </span>
+              <div className="welcome-support"><span>第一次使用？</span>
+                <Button className="quiet" icon={BookOpen} onClick={() => setModal("help")}>查看操作指引</Button>
+                <Button className="quiet" icon={Sparkles} disabled={!!busy || !ws} loading={busy === "载入示例数据"} onClick={() => void loadSample()}>用示例体验汇总</Button>
               </div>
             </div>
           ) : tab === "source" ? (
@@ -1511,6 +1507,9 @@ export default function App() {
                   }} />
                 </div>
               </div>
+              <div className="source-guidance"><strong>原表预览 <span>只读</span></strong><span>{selection
+                ? singleSelection ? `已选 ${rangeLabel(selection)}。可设为表头，或将这格信息添加为新列。` : `已选 ${rangeLabel(selection)}。如果选中的是列名，点击「设为表头」。`
+                : "先确认列名所在行；需要修改时，在表格里框选列名，再点「设为表头」。"}</span></div>
               {selectionError && <div className="notice error" role="alert">{selectionError}</div>}
               {sheet && activeSheet ? <ExcelPreview key={activeSheet} sheet={sheet} selection={selection} header={currentHeader} onSelect={selectArea} focusRow={focusRow} /> : <div className="empty-state">在左侧选择一张表，开始配置。</div>}
             </>
@@ -1884,7 +1883,7 @@ export default function App() {
                       loading={busy === "规则预览"}
                       onClick={() => void previewRules()}
                     >
-                      生成合并预览
+                      生成样本预览
                     </Button>
                   )}
                   {tab !== "preview" && !running && (
@@ -1905,7 +1904,7 @@ export default function App() {
         {phase === "configure" && !isHome && !!ws?.files.length && panels.rules && (
           <aside className="rules-panel">
             <div className="section-title">
-              <span>汇总配置</span>
+              <span>汇总规则</span>
               <span className="muted">自动保存</span>
             </div>
             <div className="output-config">
@@ -1923,25 +1922,28 @@ export default function App() {
               {mode === "bySheet" && !outputs.length && <p className="muted">在左侧启用文件并勾选 Sheet，同名表会自动汇总在一起。</p>}
               {outputProblem && <p id="output-error" className="field-error" role="alert">{outputProblem}</p>}
             </div>
-            <div className="panel-tabs">
+            <div className="panel-tabs" role="group" aria-label="基础汇总设置">
               {[
-                ["sheets", "表头"],
-                ["columns", "输出列"],
-                ["clean", "整理"],
-                ["fixed", "新增列"],
+                ["sheets", "确认表头"],
+                ["columns", "选择输出列"],
               ].map(([id, name]) => (
                 <button
                   key={id}
                   className={panelTab === id ? "active" : ""}
+                  aria-pressed={panelTab === id}
                   onClick={() => setPanelTab(id)}
                 >
                   {name}
-                  {id === "fixed" && allRules.fixedCells.length + rules.lookupColumns.length > 0 ? (
-                    <span>{allRules.fixedCells.length + rules.lookupColumns.length}</span>
-                  ) : null}
                 </button>
               ))}
             </div>
+            <details className="optional-settings" open={panelTab === "clean" || panelTab === "fixed" ? true : undefined}>
+              <summary>更多处理 <small>可选 · 整理数据、补充信息</small></summary>
+              <div className="panel-tabs" role="group" aria-label="可选汇总设置">
+                <button className={panelTab === "clean" ? "active" : ""} aria-pressed={panelTab === "clean"} onClick={() => setPanelTab("clean")}>整理数据{[rules.removeEmptyRows, rules.removeDuplicates, rules.cleanNumeric, rules.parseDates].some(Boolean) ? " · 已启用" : ""}</button>
+                <button className={panelTab === "fixed" ? "active" : ""} aria-pressed={panelTab === "fixed"} onClick={() => setPanelTab("fixed")}>补充信息{allRules.fixedCells.length + rules.lookupColumns.length > 0 ? ` · ${allRules.fixedCells.length + rules.lookupColumns.length}` : ""}</button>
+              </div>
+            </details>
             <div className="panel-scroll">
               {panelTab === "sheets" ? (
                 <>
@@ -2228,9 +2230,9 @@ export default function App() {
                 loading={busy === "规则预览"}
                 onClick={() => void previewRules()}
               >
-                快速检查当前表
+                检查合并样本
               </Button>
-              <small>每张来源表的前 200 行；完整汇总请点右上角“生成汇总结果”。</small>
+              <small>可选：先看每张来源表前 200 行的合并效果。完整结果请点上方“生成汇总结果”。</small>
             </div>
           </aside>
         )}
@@ -2485,7 +2487,7 @@ export default function App() {
               />
             </label>
             <p>
-              保存选了哪些表、从哪行开始读、保留哪些列，以及整理数据的选项。下次添加同类文件后，在「配置文件」里选它即可。
+              保存选了哪些表、从哪行开始读、保留哪些列，以及整理数据的选项。下次添加同类文件后，在「保存 / 套用规则」里选它即可。
             </p>
             {saveName.trim() &&
               !!ws?.schemes.some((s) => s.name === saveName.trim()) && (
@@ -2509,7 +2511,7 @@ export default function App() {
         </Modal>
       )}
       {modal === "reuse" && (
-        <Modal title="配置文件 · 方案管理" onClose={() => setModal(null)}>
+        <Modal title="保存 / 套用汇总规则" onClose={() => setModal(null)}>
           <div className="modal-body">
             <h3>使用以前保存的设置</h3>
             <p>新添加的文件会按相同表名匹配，复用列名行、保留列和整理数据的选项。文件内容仍来自本次勾选的文件。</p>
@@ -2986,7 +2988,7 @@ export default function App() {
                           await refresh();
                           setNotice({
                             message:
-                              "以前的设置已导入。添加新文件后，可在「配置文件」中选择；使用时会检查表名是否对应。",
+                              "以前的设置已导入。添加新文件后，可在「保存 / 套用规则」中选择；使用时会检查表名是否对应。",
                             error: false,
                           });
                         })
@@ -3040,7 +3042,7 @@ export default function App() {
                       ))}
                     </div>
                   ) : (
-                    <p className="empty-schemes-note">暂无已保存的配置方案，可从顶部「配置文件」中保存常用规则。</p>
+                    <p className="empty-schemes-note">暂无已保存的配置方案，可从顶部「保存 / 套用规则」中保存常用规则。</p>
                   )}
                 </section>
 

@@ -58,6 +58,12 @@
 .rename-selection-actions > span { width: 100%; color: var(--muted); white-space: normal; overflow-wrap: anywhere; line-height: 1.5; min-height: 18px; max-height: 40px; overflow: hidden; }
 .rename-shell .excel-fx, .rename-shell .excel-address { flex-shrink: 0; white-space: nowrap; }
 .rename-selection-actions .button { padding-inline: 9px; }
+.rename-selection-more { min-width: 0; }
+.rename-selection-more > summary { padding: 6px 3px; font-size: 12px; color: var(--muted); }
+.rename-selection-more > summary:hover { color: var(--blue); }
+.rename-selection-more[open] { flex-basis: 100%; }
+.rename-selection-more > div { display: flex; flex-wrap: wrap; gap: 8px; padding-bottom: 2px; }
+.rename-selection-more > summary:focus-visible, .rename-options > summary:focus-visible { outline: 2px solid var(--blue); outline-offset: 3px; border-radius: 4px; }
 .rename-sheet { flex: 1; min-height: 120px; overflow: hidden; display: flex; flex-direction: column; }
 .rename-sheet .excel-preview { flex: 1; min-height: 0; }
 .rename-shell .excel-scroll:focus-visible { outline: 2px solid var(--blue); outline-offset: -2px; }
@@ -75,9 +81,14 @@
 .rename-editor-scroll { padding: 16px 14px 24px; overflow-y: auto; min-height: 0; scroll-padding-block: 12px; }
 .rename-editor fieldset { width: 100%; }
 .rename-builder-section + .rename-builder-section { margin-top: 24px; }
+.rename-options { border-top: 1px solid var(--border); padding-top: 14px; }
+.rename-options > summary { color: inherit; font-size: 13px; font-weight: 600; padding-block: 4px; }
+.rename-options > summary > span { float: right; margin-left: 8px; color: var(--muted); font-size: 12px; font-weight: 400; }
 .rename-builder-section h3 { font-size: 15px; font-weight: 650; color: #263449; }
 .rename-section-heading { display: flex; align-items: baseline; gap: 8px; margin-bottom: 7px; }
 .rename-section-heading > span { color: var(--muted); font-size: 12px; }
+.rename-parts-heading { align-items: center; flex-wrap: wrap; }
+.rename-parts-heading > .button { margin-left: auto; }
 .rename-section-purpose { color: var(--muted); line-height: 1.65; font-size: 12px; }
 .rename-affixes { display: grid; grid-template-columns: minmax(0,1fr) 64px minmax(0,1fr); gap: 8px; margin-top: 10px; }
 .rename-affixes label, .rename-field { display: flex; flex-direction: column; gap: 7px; min-width: 0; }
@@ -165,14 +176,39 @@
 .rename-progress progress { width: 130px; accent-color: var(--blue); }
 .rename-dialog-body { padding: 18px 22px; display: flex; flex-direction: column; gap: 14px; overflow-y: auto; min-height: 0; }
 .rename-dialog-body .rename-field select { max-width: 100%; }
-.rename-lookup-options { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
-.rename-lookup-options > strong { width: 100%; }
+.rename-lookup-body { gap: 10px; }
+.rename-lookup-body > .rename-advanced { padding-top: 0; }
+.rename-lookup-tools { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; }
+.rename-lookup-tools > input { flex: 1; min-width: 160px; }
+.rename-lookup-body .check-label { margin: 0; }
+.rename-lookup-tools > .rename-pagination { margin-left: auto; padding: 0; }
+.rename-lookup-columns { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 12px 20px; }
+.rename-lookup-columns > .rename-field { flex: 0 1 230px; }
+.rename-lookup-columns > fieldset { flex: 1; min-width: 230px; }
+.rename-lookup-columns select { width: 100%; }
+.rename-lookup-columns legend { margin-bottom: 6px; }
+.rename-rule-result.rename-lookup-match { margin: 0; }
+.rename-lookup-match > p, .rename-lookup-match > small { grid-column: 1 / -1; overflow-wrap: anywhere; }
+.rename-lookup-match > p { color: #174cbf; font-size: 13px; font-weight: 600; }
+.rename-lookup-rule { display: grid; gap: 4px; overflow-wrap: anywhere; }
+.rename-lookup-list { list-style: none; padding: 0; margin: 0; }
+.rename-lookup-list li { display: flex; align-items: center; gap: 8px; padding: 10px 0; border-bottom: 1px solid var(--border); }
+.rename-lookup-list li > div { display: grid; gap: 4px; flex: 1; min-width: 0; overflow-wrap: anywhere; }
 .rename-table-scroll { overflow: auto; min-height: 0; }
 .rename-table-scroll table { width: 100%; border-collapse: collapse; table-layout: fixed; }
 .rename-table-scroll th { position: sticky; top: 0; z-index: 1; text-align: left; background: #f4f6fa; color: #46566d; padding: 12px; }
 .rename-table-scroll td { border-bottom: 1px solid var(--border); padding: 12px; vertical-align: top; overflow-wrap: anywhere; line-height: 1.6; }
 .rename-table-scroll td small { display: block; color: var(--muted); font-size: 12px; margin-top: 4px; }
 .rename-table-scroll tr:hover td { background: #fafcff; }
+.rename-lookup-grid { flex-shrink: 0; border: 1px solid var(--border); border-radius: 6px; }
+.rename-lookup-grid th, .rename-lookup-grid td { padding: 6px 10px; }
+.rename-lookup-grid:not(.rename-lookup-edit) table { table-layout: auto; }
+.rename-lookup-grid:not(.rename-lookup-edit) th { min-width: 100px; overflow-wrap: anywhere; }
+.rename-lookup-edit th { overflow-wrap: anywhere; }
+.rename-lookup-edit th:last-child { width: 66px; }
+.rename-lookup-edit td { padding-block: 4px; vertical-align: middle; }
+.rename-lookup-edit tr:last-child td { border-bottom: 0; }
+.rename-shell .rename-lookup-edit textarea { display: block; min-height: 30px; padding: 4px 8px; }
 .rename-review { display: flex; flex-direction: column; flex: 1; min-height: 0; background: #fff; padding: 22px 24px 10px; }
 .rename-review-heading { display: flex; gap: 16px; justify-content: space-between; align-items: center; padding-bottom: 18px; }
 .rename-review-heading h1 { font-size: 24px; margin: 8px 0 4px; }
@@ -201,8 +237,6 @@
 .rename-journal { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 12px; color: var(--muted); }
 @media (max-width: 1200px) {
   .app-header:has(.module-nav) { gap: 8px; }
-  .app-header:has(.module-nav):has(.stage-nav) { height: auto; min-height: 54px; flex-wrap: wrap; padding-block: 8px; row-gap: 4px; }
-  .app-header:has(.module-nav) .stage-nav { order: 3; flex-basis: 100%; }
 }
 @media (max-width: 900px) {
   .rename-workspace { grid-template-columns: 180px minmax(0, 1fr); }

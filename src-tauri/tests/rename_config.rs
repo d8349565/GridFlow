@@ -1,10 +1,22 @@
-use excel_workbench::{rename::{RenameCell, RenameLookupEntry, RenamePart, RenameRules}, rename_config};
+use excel_workbench::{rename::{RenameCell, RenameLookupTable, RenamePart, RenameRules}, rename_config};
 use std::{fs, path::Path};
 use tempfile::TempDir;
 
 fn isolated() -> TempDir { TempDir::new_in(Path::new(env!("CARGO_MANIFEST_DIR")).join("target")).unwrap() }
 fn rules() -> RenameRules {
-    RenameRules { parts:vec![RenamePart::Lookup { source:RenameCell {sheet:"说明".into(),row:3,column:8},name:"客户".into(),entries:vec![RenameLookupEntry {key:"001".into(),value:"仅供加密验证的客户名称".into()}],fallback:None }],separator:"_".into(),prefix:"预算_".into(),suffix:String::new(),checks:vec![] }
+    RenameRules {
+        parts: vec![RenamePart::TableLookup { source: RenameCell { sheet: "说明".into(), row: 3, column: 8 }, table_id: "customers".into(), match_column: "编号".into(), value_column: "名称".into(), fallback: None }],
+        separator: "_".into(),
+        prefix: "预算_".into(),
+        suffix: String::new(),
+        checks: vec![],
+        lookup_tables: vec![RenameLookupTable {
+            id: "customers".into(),
+            name: "客户资料".into(),
+            columns: vec!["编号".into(), "名称".into()],
+            rows: vec![vec!["001".into(), "仅供加密验证的客户名称".into()]],
+        }],
+    }
 }
 
 #[test]
@@ -35,7 +47,7 @@ fn local_draft_is_account_encrypted_and_recovers_all_lookup_entries() {
     let encrypted=fs::read(temp.path().join("rename-draft.encrypted")).unwrap();
     assert!(!encrypted.windows("仅供加密验证的客户名称".len()).any(|v|v=="仅供加密验证的客户名称".as_bytes()));
     assert_eq!(serde_json::to_value(rename_config::load_draft(temp.path()).unwrap().unwrap()).unwrap(),serde_json::to_value(&value).unwrap());
-    let empty=RenameRules {parts:vec![],separator:"_".into(),prefix:String::new(),suffix:String::new(),checks:vec![]};
+    let empty=RenameRules {parts:vec![],separator:"_".into(),prefix:String::new(),suffix:String::new(),checks:vec![],lookup_tables:vec![]};
     rename_config::save_draft(temp.path(),&empty).unwrap();
     assert!(rename_config::load_draft(temp.path()).unwrap().unwrap().parts.is_empty());
 }

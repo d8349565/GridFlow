@@ -25,7 +25,7 @@ export const TOUR_STEPS: TourStep[] = [
   {
     selector: '[data-tour="add-column-btn"]',
     title: "固定信息补充为新列",
-    description: "在“新增列”直接填写 Sheet、单元格地址和列名，也可在原表点选一个单元格。每份文件各取自己的值，默认补到所有汇总表中。",
+    description: "展开右侧“更多处理 → 补充信息”，填写 Sheet、单元格地址和列名，也可在原表点选一个单元格。每份文件各取自己的值，默认补到所有汇总表中。",
     placement: "bottom",
   },
   {

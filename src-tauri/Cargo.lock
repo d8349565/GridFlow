@@ -1412,7 +1412,7 @@ dependencies = [
 
 [[package]]
 name = "excel-workbench"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "aes-gcm",
  "argon2",

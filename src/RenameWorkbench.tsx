@@ -8,14 +8,17 @@ import ExcelPreview, { rangeLabel } from "./ExcelPreview";
 import { call, cellText, coordinate, isTauri, savePath } from "./api";
 import type { Cell, DataPage, RenameCell, RenameCheck, RenameFile, RenameOutput, RenamePage, RenamePart, RenamePlan, RenamePreset, RenamePresetSummary, RenameProgress, RenameRow, RenameRules, RenameScan, SheetAppearance, SheetRange } from "./types";
 import "./rename.css";
-import { parseLookupTable } from "./renameTable";
 import RenameConfigDialog from "./RenameConfigDialog";
+import RenameLookupDialog from "./RenameLookupDialog";
+import RenameLookupTables from "./RenameLookupTables";
+import { migrateRenameLookups } from "./renameTable";
 import RenameRulesPanel, { type PickTarget } from "./RenameRulesPanel";
 import RenamePanelLayout from "./RenamePanelLayout";
 import RenameNotification, { type RenameNoticeData } from "./RenameNotification";
 import RenamePresetDialog from "./RenamePresetDialog";
+import WorkflowBar from "./WorkflowBar";
 
-const emptyRules = (): RenameRules => ({ parts: [], separator: "_", prefix: "", suffix: "", checks: [] });
+const emptyRules = (): RenameRules => ({ parts: [], separator: "_", prefix: "", suffix: "", checks: [], lookupTables: [] });
 const label = (source: RenameCell) => `${source.sheet}!${coordinate(source.row, source.column)}`;
 const stateNames: Record<string, string> = { ready: "待执行", skipped: "已跳过", unchanged: "无需修改", renamed: "已重命名", copied: "已复制", moved: "已移动", copyOnly: "原文件保留", failed: "失败", cancelled: "未执行", restored: "已撤销", undoFailed: "撤销失败", uncertain: "需人工核对" };
 const problemStates = new Set(["skipped", "failed", "undoFailed", "uncertain", "copyOnly"]);
@@ -25,28 +28,6 @@ const errorText = (e: unknown) => e && typeof e === "object" && "message" in e ?
 const ruleKey = "gridflow_rename_rules_v1";
 const fileName = (path:string) => path.split(/[\\/]/).at(-1) || path;
 export type RenameSession = { selected: string[]; activeId: string; output?: RenameOutput };
-
-function LookupDialog({ source, onAdd, onClose }: { source: RenameCell; onAdd: (parts: RenamePart[]) => void; onClose: () => void }) {
-  const [text, setText] = useState("");
-  const [header, setHeader] = useState(true);
-  const [keyColumn, setKeyColumn] = useState(0);
-  const [chosen, setChosen] = useState<number[]>([1]);
-  const parsedTable = useMemo(() => parseLookupTable(text), [text]);
-  const parsed = parsedTable.rows;
-  const width = Math.max(0, ...parsed.map(row => row.length));
-  const names = Array.from({ length: width }, (_, i) => header ? parsed[0]?.[i] || `第 ${i + 1} 列` : `第 ${i + 1} 列`);
-  const data = header ? parsed.slice(1) : parsed;
-  const selected = chosen.filter(c => c !== keyColumn && c < width);
-  const keys = data.map(row => row[keyColumn]?.trim());
-  const invalid = parsedTable.error || (!text.trim() ? "" : width < 2 ? "请从 Excel 复制至少两列，列之间保留制表符。" : !data.length ? "标题下面还需要至少一行对照内容。" : keys.some(k => !k) || new Set(keys).size !== keys.length ? "编码列有空值或重复项，请修正后添加。" : data.some(row => selected.some(c => !row[c]?.trim())) ? "选中的对照列有空值，请补齐后添加。" : "");
-  return <Modal title="粘贴对照信息" onClose={onClose} wide><div className="modal-body rename-dialog-body">
-    <p>用 <strong>{label(source)}</strong> 的内容查找对照表。直接从 Excel 复制编码和需要的几列信息，一次添加到文件名。</p>
-    <label className="rename-field">对照表内容<textarea autoFocus rows={6} placeholder={"编码\t客户简称\t生产线名称\n001\t客户甲\t一号生产线"} value={text} onChange={e => setText(e.target.value)} /></label>
-    <label className="check-label"><input type="checkbox" checked={header} onChange={e => setHeader(e.target.checked)} />首行是标题</label>
-    {width >= 2 && <><label className="rename-field">用哪一列查找<select value={keyColumn} onChange={e => setKeyColumn(Number(e.target.value))}>{names.map((name, i) => <option key={i} value={i}>{name}</option>)}</select></label><div className="rename-lookup-options"><strong>把哪些信息加入文件名</strong>{names.map((name, i) => i !== keyColumn && <label className="check-label" key={i}><input type="checkbox" checked={chosen.includes(i)} onChange={e => setChosen(old => e.target.checked ? [...old, i] : old.filter(v => v !== i))} />{name}</label>)}</div><div className="rename-table-scroll"><table><thead><tr>{names.map((n, i) => <th key={i}>{n}</th>)}</tr></thead><tbody>{data.slice(0, 5).map((row, i) => <tr key={i}>{names.map((_, c) => <td key={c}>{row[c]}</td>)}</tr>)}</tbody></table></div><small>共 {data.length} 行，预览前 5 行。找不到对照时默认跳过该文件，可在添加后设置备用文字。</small></>}
-    {invalid && <p className="notice error" role="alert">{invalid}</p>}
-  </div><div className="modal-footer"><Button onClick={onClose}>取消</Button><Button primary disabled={!text.trim() || !!invalid || !selected.length} onClick={() => { onAdd(selected.map(c => ({ kind: "lookup", source, name: names[c], entries: data.map(row => ({ key: row[keyColumn].trim(), value: row[c].trim() })), fallback: null }))); onClose(); }}>添加 {selected.length || ""} 项对照信息</Button></div></Modal>;
-}
 
 export default function RenameWorkbench({ onBack, onBusy, session, onSessionChange, onFlush }: { onBack: () => void; onBusy: (busy: boolean) => void; session: RenameSession | null; onSessionChange: (session: RenameSession) => void; onFlush: (flush: (() => Promise<void>) | null) => void }) {
   const [files, setFiles] = useState<RenameFile[]>([]);
@@ -68,7 +49,7 @@ export default function RenameWorkbench({ onBack, onBusy, session, onSessionChan
   const [output, setOutput] = useState<RenameOutput>(session?.output ?? { mode: "original", directory: null, numberConflicts: true });
   const [presetDialog, setPresetDialog] = useState<"save" | "list" | "new" | null>(null);
   const [currentPreset, setCurrentPreset] = useState<RenamePresetSummary | null>(null);
-  const [rules, setRules] = useState<RenameRules>(() => { try { const v = JSON.parse(localStorage.getItem(ruleKey) || "null"); return v && Array.isArray(v.parts) && Array.isArray(v.checks) ? v : emptyRules(); } catch { return emptyRules(); } });
+  const [rules, setRules] = useState<RenameRules>(() => { try { const v = JSON.parse(localStorage.getItem(ruleKey) || "null"); return v && Array.isArray(v.parts) && Array.isArray(v.checks) ? migrateRenameLookups(v) : emptyRules(); } catch { return emptyRules(); } });
   const [draftReady, setDraftReady] = useState(false);
   const [draftError, setDraftError] = useState("");
   const [draftAttempt, setDraftAttempt] = useState(0);
@@ -91,7 +72,8 @@ export default function RenameWorkbench({ onBack, onBusy, session, onSessionChan
   const [plan, setPlan] = useState<RenamePlan | null>(null);
   const [view, setView] = useState<"configure" | "review">("configure");
   const [confirm, setConfirm] = useState<"execute" | "undo" | "clear" | null>(null);
-  const [lookupSource, setLookupSource] = useState<RenameCell | null>(null);
+  const [lookup, setLookup] = useState<{ source: RenameCell; index?: number } | null>(null);
+  const [manageLookups, setManageLookups] = useState(false);
   const [pick, setPick] = useState<PickTarget | null>(null);
   const editor = useRef<HTMLElement>(null);
   const sheetPreview = useRef<HTMLDivElement>(null);
@@ -107,14 +89,35 @@ export default function RenameWorkbench({ onBack, onBusy, session, onSessionChan
   const concentrated = plan?.output.mode !== undefined && plan.output.mode !== "original";
   const rows = plan?.rows.filter(r => !onlyProblems || hasProblem(r)) ?? [];
   const incompleteCheck = rules.checks.some(check => !check.sums.length);
+  const canPrepare = !busy && !pick && draftReady && !incompleteCheck && !!selected.length && !!rules.parts.length && (output.mode === "original" || !!output.directory);
+  const nextStep = busy ? `${busy}中，请稍候。`
+    : draftError ? "命名规则读取失败，请先在提示中重试。"
+    : !draftReady ? "正在读取已保存的命名规则…"
+    : view === "review" ? plan?.journalPath ? "处理结果已保留。可保存记录，或恢复上次处理的文件。" : "核对新文件名和目标位置，确认无误后再执行。"
+    : !files.length ? "先添加 Excel 文件，再从其中一份原表选择命名内容。"
+    : !selected.length ? "在左侧勾选需要重命名的文件。点击文件名可查看原表。"
+    : pick ? "在原表中完成当前选取，或按 Esc 取消。"
+    : !rules.parts.length ? "点选原表中的一个单元格，再点“加入文件名”；所有已选文件使用相同位置。"
+    : incompleteCheck ? "内容校验还缺少合计区域，请在右侧完成选取后继续。"
+    : output.mode !== "original" && !output.directory ? "已选择集中存放，请在左下方选择目标文件夹。"
+    : `已选 ${selected.length} 个文件。先查看下方新文件名，再核对全部文件；核对不会修改原文件。`;
   const validSelection = !!selection && firstPage?.sheet.fileId === activeId && firstPage.sheet.name === sheetName && firstPage.columnOffset === columnOffset;
+  const editedLookup = lookup?.index === undefined ? undefined : rules.parts[lookup.index];
+  const lookupValue = lookup && source && validSelection && label(lookup.source) === label(source) ? value : null;
+  const sampleValue = lookupValue?.kind === "number"
+    ? lookupValue.value.toLocaleString("en-US", { useGrouping: false, maximumSignificantDigits: 21 })
+    : lookupValue ? cellText(lookupValue) : undefined;
   const canConfirmPick = validSelection && (pick?.kind === "sum" || (!!source && value !== null));
-  const pickInstruction = pick?.kind === "tag" ? "请点选决定是否显示标签的单元格。" : pick?.kind === "expected" ? "请点选填写总金额或总数量的单元格。" : pick?.kind === "sumCondition" ? "请点选决定是否计入此区域的单元格。" : "请框选合计区域；选择单个单元格时，将从该行合计到表尾。";
-  const pickConfirmText = pick?.kind === "tag" ? "确认条件单元格" : pick?.kind === "expected" ? "确认填写值" : pick?.kind === "sumCondition" ? "使用此条件" : "使用此合计区域";
+  const pickInstruction = pick?.kind === "lookup" ? "请点选用于查找的单元格。" : pick?.kind === "tag" ? "请点选决定是否显示标签的单元格。" : pick?.kind === "expected" ? "请点选填写总金额或总数量的单元格。" : pick?.kind === "sumCondition" ? "请点选决定是否计入此区域的单元格。" : "请框选合计区域；选择单个单元格时，将从该行合计到表尾。";
+  const pickConfirmText = pick?.kind === "lookup" ? "使用此单元格" : pick?.kind === "tag" ? "确认条件单元格" : pick?.kind === "expected" ? "确认填写值" : pick?.kind === "sumCondition" ? "使用此条件" : "使用此合计区域";
   useEffect(() => {
     if (!pick) return;
     sheetPreview.current?.querySelector<HTMLElement>(".excel-scroll")?.focus();
-    if (pick.kind !== "tag" && pick.check !== undefined) editor.current?.querySelectorAll(".rename-check")[pick.check]?.scrollIntoView({ block:"nearest" });
+    if (["expected", "sum", "sumCondition"].includes(pick.kind)) {
+      const checks = editor.current?.querySelector<HTMLDetailsElement>(".rename-checks");
+      if (checks) checks.open = true;
+    }
+    if ("check" in pick && pick.check !== undefined) editor.current?.querySelectorAll(".rename-check")[pick.check]?.scrollIntoView({ block:"nearest" });
     const cancel=(e: KeyboardEvent) => { if(e.key === "Escape") { e.preventDefault(); setPick(null); } };
     document.addEventListener("keydown",cancel); return () => document.removeEventListener("keydown",cancel);
   }, [pick]);
@@ -157,7 +160,7 @@ export default function RenameWorkbench({ onBack, onBusy, session, onSessionChan
     void (async () => {
       const encrypted=await call<RenameRules | null>("rename_load_draft");
       const legacy=localStorage.getItem(ruleKey);
-      const next=legacy ? JSON.parse(legacy) as RenameRules : encrypted ?? emptyRules();
+      const next=migrateRenameLookups(legacy ? JSON.parse(legacy) as RenameRules : encrypted ?? emptyRules());
       if (legacy) { await call("rename_save_draft",{rules:next}); localStorage.removeItem(ruleKey); }
       if (!disposed) { setRules(next); setDraftReady(true); }
     })().catch(e => { if (!disposed) setDraftError(errorText(e)); });
@@ -230,7 +233,10 @@ export default function RenameWorkbench({ onBack, onBusy, session, onSessionChan
   }
   function confirmPick() {
     if (!pick || !selection || !canConfirmPick) return;
-    if (pick.kind === "tag") {
+    if (pick.kind === "lookup") {
+      const part = rules.parts[pick.part];
+      if (source && part?.kind === "tableLookup") partAt(pick.part, { ...part, source });
+    } else if (pick.kind === "tag") {
       if (!source) return;
       const part=pick.part === undefined ? null : rules.parts[pick.part];
       if (pick.part === undefined) addPart({kind:"condition",condition:{source,operator:"positive",value:""},text:"【标签】"});
@@ -272,7 +278,7 @@ export default function RenameWorkbench({ onBack, onBusy, session, onSessionChan
     if (typeof path === "string") setConfiguration({mode:"load",path});
   }); }
   function rememberPreset(preset: RenamePresetSummary) { setCurrentPreset(preset); localStorage.setItem("gridflow_rename_preset_id",preset.id); }
-  function usePreset(preset: RenamePreset) { change(preset.rules); rememberPreset(preset.summary); setPick(null); setDraftReady(true); setDraftError(""); setView("configure"); notify("success","已使用本机配置",preset.summary.name); }
+  function usePreset(preset: RenamePreset) { change(migrateRenameLookups(preset.rules)); rememberPreset(preset.summary); setPick(null); setDraftReady(true); setDraftError(""); setView("configure"); notify("success","已使用本机配置",preset.summary.name); }
   function configWorking(working: boolean) { task.current=working; onBusy(working); setBusy(working ? "保存或读取配置" : ""); }
   function changeOutput(next: RenameOutput) { setOutput(next); setPlan(null); }
   async function chooseOutput() { await run("选择输出文件夹",async () => {const path=await open({directory:true,multiple:false,title:"选择集中保存的文件夹"});if(typeof path === "string") changeOutput({...output,directory:path});}); }
@@ -283,10 +289,17 @@ export default function RenameWorkbench({ onBack, onBusy, session, onSessionChan
   async function exportLog() { if (!plan) return; await run("保存日志与汇总", async () => { const path = await savePath(`重命名日志与汇总_${new Date().toISOString().slice(0, 10)}.xlsx`, "xlsx"); if (path) { await call("rename_export", { plan, path }); notify("success","日志与汇总已保存",fileName(path),path); } }); }
 
   return <div className="app-shell rename-shell">
-    <header className="app-header"><div className="brand"><div className="app-mark"><FileSpreadsheet size={18} /></div><strong>汇格 · GridFlow</strong></div><nav className="module-nav" aria-label="工具入口"><button disabled={!!busy} onClick={() => void leave()}>Excel 汇总</button><button className="active" aria-current="page">批量重命名</button></nav><div className="header-actions"><Button className="quiet" icon={Save} disabled={!!busy || !!pick || !draftReady} onClick={() => setPresetDialog("save")}>保存配置</Button><Button className="quiet" icon={FolderOpen} title={currentPreset ? `当前：${currentPreset.name}` : "选择本机已保存的配置，或导入、导出配置"} disabled={!!busy || !!pick || !draftReady} onClick={() => setPresetDialog("list")}>本机配置</Button><Button className="quiet" icon={History} disabled={!!busy} onClick={() => void history()}>上次记录与恢复</Button>{view === "configure" && <Button primary icon={Check} disabled={!!busy || !!pick || !draftReady || incompleteCheck || !selected.length || !rules.parts.length || (output.mode !== "original" && !output.directory)} onClick={() => void prepare()}>核对全部 {selected.length || ""} 个文件名</Button>}</div></header>
+    <header className="app-header"><div className="brand"><div className="app-mark"><FileSpreadsheet size={18} /></div><strong>汇格 · GridFlow</strong></div><nav className="module-nav" aria-label="工具入口"><button disabled={!!busy} onClick={() => void leave()}>Excel 汇总</button><button className="active" aria-current="page">批量重命名</button></nav><div className="header-actions"><Button className="quiet" icon={Save} disabled={!!busy || !!pick || !draftReady} onClick={() => setPresetDialog("save")}>保存配置</Button><Button className="quiet" icon={FolderOpen} title={currentPreset ? `当前：${currentPreset.name}` : "选择本机已保存的配置，或导入、导出配置"} disabled={!!busy || !!pick || !draftReady} onClick={() => setPresetDialog("list")}>本机配置</Button><Button className="quiet" icon={History} disabled={!!busy} onClick={() => void history()}>上次记录与恢复</Button></div></header>
+    <WorkflowBar label="重命名步骤" current={view === "review" ? 2 : selected.length ? 1 : 0} steps={[
+      {label:"添加文件", disabled:!!busy || !!pick, onClick:() => { if(view === "review") setView("configure"); else void choose(false); }},
+      {label:"组成文件名", disabled:!!busy || !!pick || !files.length, onClick:() => { setView("configure"); }},
+      {label:"核对并执行", disabled:!!busy || (view !== "review" && !canPrepare), onClick:() => { if(view !== "review") void prepare(); }},
+    ]} hint={nextStep} actions={view === "configure" && (!files.length
+      ? <Button primary icon={Plus} disabled={!!busy || !draftReady} onClick={() => void choose(false)}>添加 Excel 文件</Button>
+      : <Button primary icon={Check} disabled={!canPrepare} onClick={() => void prepare()}>下一步：核对文件名{selected.length ? `（${selected.length}）` : ""}</Button>)} />
     {(notice || draftError) && <div className="rename-notifications">
       {draftError && <RenameNotification notice={{kind:"error",title:"加密草稿读取失败",detail:draftError}} onRetry={() => setDraftAttempt(v => v + 1)} />}
-      {notice && <RenameNotification notice={notice} onClose={clearNotice} paused={!!configuration || !!presetDialog || !!confirm || !!closeError} />}
+      {notice && <RenameNotification notice={notice} onClose={clearNotice} paused={!!configuration || !!presetDialog || !!confirm || !!closeError || !!lookup || manageLookups} />}
     </div>}
     {busy && <div className="rename-progress" role="status"><span>{progress?.busy ? progress.phase : busy} {progress?.total ? `${progress.done} / ${progress.total}` : ""}</span><span title={progress?.current}>{progress?.current}</span>{progress?.total ? <progress value={progress.done} max={progress.total} /> : <progress />}{cancellable && <Button icon={Square} disabled={!progress?.busy} onClick={() => void call("rename_cancel").then(() => notify("info","正在停止","已完成的结果和恢复记录会保留。")).catch(e => notify("error","停止任务未完成",errorText(e)))}>停止</Button>}</div>}
     {view === "configure" ? <RenamePanelLayout files={
@@ -298,15 +311,28 @@ export default function RenameWorkbench({ onBack, onBusy, session, onSessionChan
         </section>
       </aside>} source={<main className="rename-source"><div className="pane-toolbar"><strong title={activeFile?.path}>{activeFile?.name ?? "从原表中选择命名内容"}</strong>{sheetNames.length > 0 && <select aria-label="重命名取值工作表" disabled={!!busy} value={sheetName} onChange={e => { setColumnOffset(0); setPreviewFocusRow(1); setSelection(null); setSheetName(e.target.value); }}>{sheetNames.map(s => <option key={s}>{s}</option>)}</select>}</div>
         {sheetName && <div className="rename-preview-window" aria-label="原表预览范围"><div><Button className="quiet icon-button" icon={ArrowLeft} aria-label="上一组列" title="上一组列" disabled={!!busy || !columnOffset || !firstPage} onClick={() => changeColumns(columnOffset - 80)} /><span>列 {coordinate(1,columnOffset+1).slice(0,-1)}–{coordinate(1,columnOffset+(firstPage?.sheet.width ?? 80)).slice(0,-1)}</span><Button className="quiet icon-button" icon={ArrowRight} aria-label="下一组列" title="下一组列" disabled={!!busy || !firstPage || columnOffset+firstPage.sheet.width >= firstPage.totalColumns} onClick={() => changeColumns(columnOffset + 80)} /></div><form onSubmit={e => {e.preventDefault();locateCell();}}><input aria-label="定位单元格地址" placeholder="如 K35" maxLength={14} value={gotoAddress} disabled={!!busy} onChange={e => setGotoAddress(e.target.value)} /><Button type="submit" disabled={!!busy || !gotoAddress.trim()}>定位单元格</Button></form></div>}
-        {pick ? <div className="rename-pick-banner" role="status"><div className="rename-pick-description"><strong>{pickInstruction}</strong><span>{validSelection && selection ? `${sheetName}!${rangeLabel(selection)}${source ? ` · ${cellText(value ?? undefined) || "空白"}` : ""}` : "尚未选择，支持切换工作表；按 Esc 可取消。"}</span></div><Button primary disabled={!!busy || !canConfirmPick} onClick={confirmPick}>{pickConfirmText}</Button><Button icon={X} aria-label="取消选取" onClick={() => setPick(null)} /></div> : <div className="rename-selection-actions"><span>{source ? `${label(source)} · ${cellText(value ?? undefined) || "空白"}` : "先选内容再加入文件名；条件和校验先点功能再选。"}</span><Button disabled={!!busy || !draftReady || !source} icon={Plus} primary onClick={() => source && addPart({ kind: "cell", source, decimals: null })}>加入文件名</Button><Button disabled={!!busy || !draftReady || !source} onClick={() => setLookupSource(source)}>添加对照</Button><Button disabled={!!busy || !draftReady || !firstPage} onClick={() => startPick({kind:"tag"})}>条件标签</Button><Button disabled={!!busy || !draftReady || !firstPage} onClick={() => startPick({kind:"expected"})}>添加校验</Button></div>}
-        <div ref={sheetPreview} className={`rename-sheet ${pick ? "is-picking" : ""}`}>{sheetError ? <div className="empty-state"><p role="alert">{sheetError}</p><Button onClick={() => setEpoch(v => v + 1)}>重新读取</Button></div> : firstPage && firstPage.columnOffset === columnOffset ? <ExcelPreview key={`${activeId}:${sheetName}:${epoch}:${columnOffset}:${positionKey}`} sheet={{...firstPage.sheet,rows:Math.max(firstPage.sheet.rows,previewFocusRow)}} columnOffset={firstPage.columnOffset} focusRow={previewFocusRow} focusColumn={previewFocusColumn} selection={selection} header={null} onSelect={(r, c) => { setSelection(r); setValue(c); }} loadPage={loadPage} caption="点选单元格命名 · 合并单元格取左上角 · 公式使用 Excel 已保存的结果" /> : <div className="empty-state">{activeId ? "正在读取工作表…" : <><FilePenLine size={36} /><h2>点选内容，批量生成文件名</h2><p>添加文件 → 点选单元格 → 核对并执行。<br />编码对照、金额/数量校验和条件标签按需添加。</p></>}</div>}</div>
+        {pick ? <div className="rename-pick-banner" role="status"><div className="rename-pick-description"><strong>{pickInstruction}</strong><span>{validSelection && selection ? `${sheetName}!${rangeLabel(selection)}${source ? ` · ${cellText(value ?? undefined) || "空白"}` : ""}` : "尚未选择，支持切换工作表；按 Esc 可取消。"}</span></div><Button primary disabled={!!busy || !canConfirmPick} onClick={confirmPick}>{pickConfirmText}</Button><Button icon={X} aria-label="取消选取" onClick={() => setPick(null)} /></div> : <div className="rename-selection-actions">
+          <span>{source ? `${label(source)} · ${cellText(value ?? undefined) || "空白"}` : "点选一个单元格，可直接取值或查对照表。"}</span>
+          <Button disabled={!!busy || !draftReady || !source} icon={Plus} primary onClick={() => source && addPart({ kind: "cell", source, decimals: null })}>加入文件名</Button>
+          <Button disabled={!!busy || !draftReady || !validSelection || !source} onClick={() => source && setLookup({ source })}>从对照表取值</Button>
+          <details className="rename-selection-more"><summary>条件与校验</summary><div>
+            <Button disabled={!!busy || !draftReady || !firstPage} onClick={() => startPick({kind:"tag"})}>添加条件标签</Button>
+            <Button disabled={!!busy || !draftReady || !firstPage} onClick={() => startPick({kind:"expected"})}>添加内容校验</Button>
+          </div></details>
+        </div>}
+        <div ref={sheetPreview} className={`rename-sheet ${pick ? "is-picking" : ""}`}>{sheetError ? <div className="empty-state"><p role="alert">{sheetError}</p><Button onClick={() => setEpoch(v => v + 1)}>重新读取</Button></div> : firstPage && firstPage.columnOffset === columnOffset ? <ExcelPreview key={`${activeId}:${sheetName}:${epoch}:${columnOffset}:${positionKey}`} sheet={{...firstPage.sheet,rows:Math.max(firstPage.sheet.rows,previewFocusRow)}} columnOffset={firstPage.columnOffset} focusRow={previewFocusRow} focusColumn={previewFocusColumn} selection={selection} header={null} onSelect={(r, c) => { setSelection(r); setValue(c); }} loadPage={loadPage} caption="点选单元格命名 · 合并单元格取左上角 · 公式使用 Excel 已保存的结果" /> : <div className="empty-state">{activeId ? "正在读取工作表…" : <><FilePenLine size={36} /><h2>点选内容，批量生成文件名</h2><p>添加文件 → 点选单元格 → 核对并执行。<br />对照取值、金额/数量校验和条件标签按需添加。</p></>}</div>}</div>
         <section className="rename-live" aria-label="当前文件实时预览" aria-live="polite"><div><strong>当前文件名预览</strong><small>{livePending ? "正在更新…" : "随规则自动更新；执行前还会核对全部文件"}</small></div><p className={liveError || live?.state === "skipped" ? "rename-invalid" : ""}>{!draftReady ? "正在读取加密草稿…" : incompleteCheck ? "请选择校验的合计区域，完成后更新预览" : livePending ? "正在读取所选内容…" : liveError || live?.newName || (rules.parts.length ? live?.message || "选择文件查看预览" : "在上方点选单元格，加入文件名")}</p>{live && <><small>{stateNames[live.state]}{live.message ? ` · ${live.message}` : ""}</small>{!!live.checks.length && <details><summary>查看 {live.checks.length} 项校验结果</summary>{live.checks.map((c, i) => <p key={i}>{c}</p>)}</details>}</>}</section>
-      </main>} rules={<RenameRulesPanel rules={rules} live={live} livePending={livePending} busy={!!busy} picking={!!pick} ready={draftReady} editorRef={editor} onChange={change} onPick={startPick} onReset={() => setConfirm("clear")} />
+      </main>} rules={<RenameRulesPanel rules={rules} live={live} livePending={livePending} busy={!!busy} picking={!!pick} ready={draftReady} editorRef={editor} onChange={change} onPick={startPick} onEditLookup={(index, source) => setLookup({ source, index })} onManageLookups={() => setManageLookups(true)} onReset={() => setConfirm("clear")} />
     } /> : <main className="rename-review"><div className="rename-review-heading"><div><Button className="quiet" icon={ArrowLeft} disabled={!!busy} onClick={() => setView("configure")}>返回命名规则</Button><h1>{plan?.journalPath ? "文件处理记录" : "核对文件名"}</h1><p>{plan?.journalPath ? `已完成 ${processedCount} 个 · 已撤销 ${plan.rows.filter(r => r.state === "restored").length} 个` : `${readyCount} 个可以处理 · ${(plan?.rows.length ?? 0) - readyCount} 个无需处理或已跳过`}</p>{concentrated && <p className="rename-review-destination"><strong>{plan?.output.mode === "copy" ? "复制到" : "移动到"}</strong><span title={displayPath(plan?.output.directory ?? "")}>{displayPath(plan?.output.directory ?? "")}</span></p>}</div><div className="rename-review-actions"><Button icon={Download} disabled={!!busy || !plan} onClick={() => void exportLog()}>保存日志与汇总</Button>{plan?.journalPath ? <Button icon={RotateCcw} disabled={!!busy || !undoCount} onClick={() => setConfirm("undo")}>{plan?.output.mode === "copy" ? "撤销副本" : concentrated ? "恢复原位" : "恢复原名"}（{undoCount}）</Button> : <Button primary icon={FilePenLine} disabled={!!busy || !readyCount} onClick={() => setConfirm("execute")}>{concentrated ? plan?.output.mode === "copy" ? "重命名并复制" : "重命名并移动" : "执行重命名"}（{readyCount}）</Button>}</div></div><div className="rename-review-filter"><label className="check-label"><input type="checkbox" checked={onlyProblems} onChange={e => { setOnlyProblems(e.target.checked); setPageIndex(0); }} />只看需要处理的问题</label><span>共 {rows.length} 项 · 每页 100 项</span></div><div className="rename-table-scroll"><table><thead><tr><th>原文件名</th><th>{concentrated ? "新文件名 / 目标路径" : "新文件名"}</th><th>状态</th><th>说明 / 校验结果</th></tr></thead><tbody>{rows.slice(pageIndex * 100, (pageIndex + 1) * 100).map(row => <tr key={row.id}><td title={displayPath(row.path)}>{row.originalName}<small>{displayPath(row.path)}</small></td><td>{row.newName || "—"}{row.targetPath && <small title={displayPath(row.targetPath)}>{displayPath(row.targetPath)}</small>}</td><td className={problemStates.has(row.state) ? "rename-invalid" : ""}><span className="rename-state" data-state={row.state}>{stateNames[row.state] ?? row.state}</span>{row.hasMismatch && <span className="rename-check-warning">校验不一致</span>}</td><td>{row.message || "—"}{!!row.checks.length && <details><summary>{row.checks.length} 项校验</summary>{row.checks.map((c, i) => <p key={i}>{c}</p>)}</details>}</td></tr>)}</tbody></table>{!rows.length && <div className="empty-state">没有符合条件的记录。</div>}</div><div className="rename-pagination"><Button disabled={!pageIndex} onClick={() => setPageIndex(v => v - 1)}>上一页</Button><span>{rows.length ? pageIndex + 1 : 0} / {Math.ceil(rows.length / 100)}</span><Button disabled={(pageIndex + 1) * 100 >= rows.length} onClick={() => setPageIndex(v => v + 1)}>下一页</Button></div>{plan?.journalPath && <p className="rename-journal" title={plan.journalPath}>恢复记录已保存在本机：{plan.journalPath}</p>}</main>}
     {closeError && <Modal title="退出前保存失败" onClose={() => { if(!busy) setCloseError(""); }}><div className="modal-body rename-dialog-body"><p>最新的命名规则尚未自动保存，窗口已保留。可重试，或导出加密配置后退出。</p><p className="notice error" role="alert">{closeError}</p></div><div className="modal-footer"><Button disabled={!!busy} onClick={() => setCloseError("")}>返回编辑</Button><Button disabled={!!busy} onClick={() => { setCloseError(""); setExitAfterSave(true); setConfiguration({mode:"save",path:""}); }}>导出配置后退出</Button><Button primary loading={busy === "保存并退出"} disabled={!!busy} onClick={() => void retryClose()}>重试保存并退出</Button></div></Modal>}
     {configuration && <RenameConfigDialog mode={configuration.mode} path={configuration.path} rules={rules} onClose={() => { setConfiguration(null); setExitAfterSave(false); }} onSaved={path => { notify("success","加密配置已导出",fileName(path),path); if(exitAfterSave) void getCurrentWindow().destroy().catch(e => setCloseError(errorText(e))); }} onLoad={preset => { usePreset(preset); notify("success","配置已导入并加入本机",preset.summary.name); }} onWorking={configWorking} />}
     {presetDialog && <RenamePresetDialog key={presetDialog} mode={presetDialog === "list" ? "list" : "save"} current={presetDialog === "new" ? null : currentPreset} rules={rules} onClose={() => setPresetDialog(null)} onSaved={preset => { rememberPreset(preset); notify("success","配置已保存到本机",preset.name); }} onLoad={usePreset} onTransfer={mode => { setPresetDialog(null); if (mode === "save") setConfiguration({mode,path:""}); else void chooseConfiguration(); }} onSaveAs={() => setPresetDialog("new")} onWorking={configWorking} />}
-    {lookupSource && <LookupDialog source={lookupSource} onAdd={parts => change({ ...rules, parts: [...rules.parts, ...parts] })} onClose={() => setLookupSource(null)} />}
-    {confirm && <Modal title={confirm === "execute" ? concentrated ? "确认集中保存文件" : "确认修改原文件名" : confirm === "undo" ? "确认撤销上次处理" : "清空命名规则"} onClose={() => setConfirm(null)}><p className="modal-body rename-dialog-body">{confirm === "execute" ? concentrated ? `将 ${readyCount} 个文件重命名后${plan?.output.mode === "copy" ? "复制" : "移动"}到：${displayPath(plan?.output.directory ?? "")}。${plan?.output.mode === "copy" ? "原文件保留。" : "成功移动后，原位置不再保留。"}同名文件不会覆盖，异常会记入日志。` : `将在原文件夹中重命名 ${readyCount} 个文件。同名文件不会覆盖，异常会跳过并记入日志；可从“上次记录与恢复”恢复原名。` : confirm === "undo" ? plan?.output.mode === "copy" ? `撤销 ${undoCount} 个生成的副本。仅在原文件仍存在且两边都未变化时移除副本，其他情况保留并说明原因。` : `将 ${undoCount} 个文件恢复到原路径和原名。若文件已变化或原路径被占用，将保留现状并列出原因。` : "将清空命名内容、对照信息和校验规则。磁盘中的文件保持不变。"}</p><div className="modal-footer"><Button onClick={() => setConfirm(null)}>取消</Button><Button primary onClick={() => confirm === "execute" ? void execute() : confirm === "undo" ? void undo() : (change(emptyRules()), setPick(null), setConfirm(null))}>{confirm === "execute" ? concentrated ? plan?.output.mode === "copy" ? "确认复制" : "确认移动" : "确认重命名" : confirm === "undo" ? "确认撤销" : "清空规则"}</Button></div></Modal>}
+    {manageLookups && <RenameLookupTables tables={rules.lookupTables} bindings={rules.parts.filter(part => part.kind === "tableLookup")} onChange={lookupTables => change({ ...rules, lookupTables })} onClose={() => setManageLookups(false)} />}
+    {lookup && <RenameLookupDialog source={lookup.source} sampleValue={sampleValue} tables={rules.lookupTables} existing={editedLookup?.kind === "tableLookup" ? editedLookup : undefined} slots={lookup.index === undefined ? Math.max(0, 64 - rules.parts.length) : 1} onSave={(parts, newTable) => {
+      const nextParts = lookup.index === undefined ? [...rules.parts, ...parts] : rules.parts.map((part, i) => i === lookup.index ? parts[0] : part);
+      change({ ...rules, parts: nextParts, lookupTables: newTable ? [...rules.lookupTables, newTable] : rules.lookupTables });
+      setLookup(null);
+    }} onClose={() => setLookup(null)} />}
+    {confirm && <Modal title={confirm === "execute" ? concentrated ? "确认集中保存文件" : "确认修改原文件名" : confirm === "undo" ? "确认撤销上次处理" : "清空命名规则"} onClose={() => setConfirm(null)}><p className="modal-body rename-dialog-body">{confirm === "execute" ? concentrated ? `将 ${readyCount} 个文件重命名后${plan?.output.mode === "copy" ? "复制" : "移动"}到：${displayPath(plan?.output.directory ?? "")}。${plan?.output.mode === "copy" ? "原文件保留。" : "成功移动后，原位置不再保留。"}同名文件不会覆盖，异常会记入日志。` : `将在原文件夹中重命名 ${readyCount} 个文件。同名文件不会覆盖，异常会跳过并记入日志；可从“上次记录与恢复”恢复原名。` : confirm === "undo" ? plan?.output.mode === "copy" ? `撤销 ${undoCount} 个生成的副本。仅在原文件仍存在且两边都未变化时移除副本，其他情况保留并说明原因。` : `将 ${undoCount} 个文件恢复到原路径和原名。若文件已变化或原路径被占用，将保留现状并列出原因。` : "将清空文件名格式、命名项和校验规则。已保存的对照表可继续使用。"}</p><div className="modal-footer"><Button onClick={() => setConfirm(null)}>取消</Button><Button primary onClick={() => confirm === "execute" ? void execute() : confirm === "undo" ? void undo() : (change({ ...emptyRules(), lookupTables: rules.lookupTables }), setPick(null), setConfirm(null))}>{confirm === "execute" ? concentrated ? plan?.output.mode === "copy" ? "确认复制" : "确认移动" : "确认重命名" : confirm === "undo" ? "确认撤销" : "清空规则"}</Button></div></Modal>}
   </div>;
 }

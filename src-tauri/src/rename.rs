@@ -3,7 +3,7 @@ use crate::{model::*, reader};
 use calamine::{open_workbook_auto, Data, Reader, Sheets};
 use crate::rename_read::{Scope, SheetCells};
 use serde::{Deserialize, Serialize};
-use std::{collections::{HashMap, HashSet}, fs::{self, File, FileTimes, OpenOptions}, io::{BufRead, BufReader, Read, Write}, path::{Path, PathBuf}, sync::{atomic::{AtomicBool, Ordering}, Mutex}, time::UNIX_EPOCH};
+use std::{collections::{hash_map::Entry, HashMap, HashSet}, fs::{self, File, FileTimes, OpenOptions}, io::{BufRead, BufReader, Read, Write}, path::{Path, PathBuf}, rc::Rc, sync::{atomic::{AtomicBool, Ordering}, Mutex}, time::UNIX_EPOCH};
 use ts_rs::TS;
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -18,11 +18,28 @@ pub struct RenameCondition { pub source: RenameCell, pub operator: String, pub v
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct RenameLookupEntry { pub key: String, pub value: String }
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct RenameLookupTable {
+    pub id: String,
+    pub name: String,
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<String>>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum RenamePart {
     Cell { source: RenameCell, decimals: Option<u8> },
     Text { text: String },
     Lookup { source: RenameCell, #[serde(default)] name: String, entries: Vec<RenameLookupEntry>, fallback: Option<String> },
+    TableLookup {
+        source: RenameCell,
+        #[serde(rename = "tableId")]
+        table_id: String,
+        #[serde(rename = "matchColumn")]
+        match_column: String,
+        #[serde(rename = "valueColumn")]
+        value_column: String,
+        fallback: Option<String>,
+    },
     Condition { condition: RenameCondition, text: String },
 }
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -33,7 +50,15 @@ pub struct RenameSum { pub area: RenameArea, pub divisor: f64, pub min_filled: u
 pub struct RenameCheck { pub label: String, pub expected: RenameCell, pub sums: Vec<RenameSum>, pub tolerance_percent: f64 }
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
-pub struct RenameRules { pub parts: Vec<RenamePart>, pub separator: String, pub prefix: String, pub suffix: String, pub checks: Vec<RenameCheck> }
+pub struct RenameRules {
+    pub parts: Vec<RenamePart>,
+    pub separator: String,
+    pub prefix: String,
+    pub suffix: String,
+    pub checks: Vec<RenameCheck>,
+    #[serde(default)]
+    pub lookup_tables: Vec<RenameLookupTable>,
+}
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all="camelCase")]
 pub enum RenameOutputMode { #[default] Original, Copy, Move }
@@ -81,7 +106,13 @@ impl Book {
     fn configure(&mut self, rules: &RenameRules) {
         let mut scopes = HashMap::<String,Scope>::new();
         fn cell(scopes: &mut HashMap<String,Scope>, c: &RenameCell) { scopes.entry(c.sheet.clone()).or_default().areas.push(SheetRange {start_row:c.row,end_row:c.row,start_column:c.column,end_column:c.column}); }
-        for part in &rules.parts {match part {RenamePart::Cell {source,..}|RenamePart::Lookup {source,..}=>cell(&mut scopes,source),RenamePart::Condition {condition,..}=>cell(&mut scopes,&condition.source),RenamePart::Text {..}=>{}}}
+        for part in &rules.parts {
+            match part {
+                RenamePart::Cell { source, .. } | RenamePart::Lookup { source, .. } | RenamePart::TableLookup { source, .. } => cell(&mut scopes, source),
+                RenamePart::Condition { condition, .. } => cell(&mut scopes, &condition.source),
+                RenamePart::Text { .. } => {},
+            }
+        }
         for check in &rules.checks {
             cell(&mut scopes,&check.expected);
             for sum in &check.sums {
@@ -162,12 +193,7 @@ fn validate_rules(rules: &RenameRules) -> Result<()> {
     for part in &rules.parts {
         match part {
             RenamePart::Cell { source, decimals } => { validate_cell(source)?; if decimals.is_some_and(|v| v > 10) { return Err(AppError::new("RULE", "小数位数应为 0～10")); } },
-            RenamePart::Lookup { source, entries, .. } => {
-                validate_cell(source)?;
-                if entries.is_empty() || entries.len() > 10000 { return Err(AppError::new("RULE", "对照表需要 1～10000 行")); }
-                let mut keys = HashSet::new();
-                for e in entries { if e.key.trim().is_empty() || e.value.trim().is_empty() || !keys.insert(e.key.trim()) { return Err(AppError::new("RULE", "对照表包含空值或重复编码，请先修正")); } }
-            },
+            RenamePart::Lookup { source, .. } | RenamePart::TableLookup { source, .. } => validate_cell(source)?,
             RenamePart::Condition { condition, .. } => validate_cell(&condition.source)?,
             RenamePart::Text { .. } => {},
         }
@@ -194,10 +220,107 @@ fn safe_name(stem: &str, extension: &str) -> Result<(String, bool)> {
     if name.encode_utf16().count() > 240 { return Err(AppError::new("NAME", "文件名过长，请减少命名内容")); }
     Ok((name, clean != stem))
 }
-fn lookup_tables(rules: &RenameRules) -> Vec<HashMap<&str, &str>> {
-    rules.parts.iter().map(|p| match p { RenamePart::Lookup { entries, .. } => entries.iter().map(|e| (e.key.trim(), e.value.trim())).collect(), _ => HashMap::new() }).collect()
+type LookupRows<'a> = HashMap<&'a str, &'a [String]>;
+
+enum LookupIndex<'a> {
+    Legacy(HashMap<&'a str, &'a str>),
+    Table {
+        rows: Rc<LookupRows<'a>>,
+        table: &'a str,
+        match_column: &'a str,
+        value_column: &'a str,
+        value_index: usize,
+    },
 }
-fn row_for(file: &RenameFile, rules: &RenameRules, lookups: &[HashMap<&str, &str>], book: &mut Book, output:&RenameOutput) -> Result<RenameRow> {
+
+impl LookupIndex<'_> {
+    fn value(&self, key: &str) -> Option<&str> {
+        match self {
+            Self::Legacy(values) => values.get(key).copied(),
+            Self::Table { rows, value_index, .. } => rows.get(key).map(|row| row[*value_index].trim()),
+        }
+    }
+
+    fn missing(&self, source: &RenameCell, key: &str, matched: bool) -> AppError {
+        let location = format!("{}!{}", source.sheet, reader::cell_address(source.row, source.column));
+        let message = if key.is_empty() {
+            format!("{location} 的匹配值为空，请补齐后重新核对")
+        } else {
+            match self {
+                Self::Table { table, value_column, .. } if matched => format!("{location} 的值“{key}”对应的「{value_column}」为空，请补齐对照表「{table}」"),
+                Self::Table { table, match_column, .. } => format!("{location} 的值“{key}”在对照表「{table}」的「{match_column}」列中找不到"),
+                Self::Legacy(_) => format!("{location} 的值“{key}”找不到对应内容，请补充对照表"),
+            }
+        };
+        AppError::new("LOOKUP", message)
+    }
+}
+
+fn index_lookup_rows(table: &RenameLookupTable, column: usize) -> Result<LookupRows<'_>> {
+    let mut names = HashSet::new();
+    if !(2..=64).contains(&table.columns.len()) || !(1..=10000).contains(&table.rows.len())
+        || table.columns.iter().any(|name| name.trim().is_empty() || !names.insert(name.trim()))
+        || table.rows.iter().any(|row| row.len() != table.columns.len())
+    {
+        return Err(AppError::new("RULE", format!("对照表「{}」的行数或列名无效，请检查表格", table.name)));
+    }
+    let mut rows = HashMap::with_capacity(table.rows.len());
+    for (index, row) in table.rows.iter().enumerate() {
+        let key = row[column].trim();
+        let column_name = &table.columns[column];
+        if key.is_empty() {
+            return Err(AppError::new("RULE", format!("对照表「{}」的「{column_name}」第 {} 行为空，请补齐匹配值", table.name, index + 1)));
+        }
+        if rows.insert(key, row.as_slice()).is_some() {
+            return Err(AppError::new("RULE", format!("对照表「{}」的「{column_name}」列有重复值“{key}”，请保留正确的一行", table.name)));
+        }
+    }
+    Ok(rows)
+}
+
+fn lookup_tables(rules: &RenameRules) -> Result<Vec<Option<LookupIndex<'_>>>> {
+    let mut tables = HashMap::new();
+    for table in &rules.lookup_tables {
+        if table.id.trim().is_empty() || tables.insert(table.id.as_str(), table).is_some() {
+            return Err(AppError::new("RULE", "对照表标识无效或重复，请重新选择对照表"));
+        }
+    }
+    let mut indices = HashMap::new();
+    rules.parts.iter().map(|part| {
+        let index = match part {
+            RenamePart::Lookup { entries, .. } => {
+                if !(1..=10000).contains(&entries.len()) { return Err(AppError::new("RULE", "对照表需要 1～10000 行")); }
+                let mut values = HashMap::new();
+                for entry in entries {
+                    let (key, value) = (entry.key.trim(), entry.value.trim());
+                    if key.is_empty() || value.is_empty() || values.insert(key, value).is_some() {
+                        return Err(AppError::new("RULE", "对照表包含空值或重复匹配值，请先修正"));
+                    }
+                }
+                LookupIndex::Legacy(values)
+            },
+            RenamePart::TableLookup { table_id, match_column, value_column, .. } => {
+                let table = tables.get(table_id.as_str()).ok_or_else(|| AppError::new("RULE", "命名项引用的对照表已不存在，请重新选择"))?;
+                let column_index = |name: &str| table.columns.iter().position(|column| column == name)
+                    .ok_or_else(|| AppError::new("RULE", format!("对照表「{}」中没有「{name}」列，请修改取值规则", table.name)));
+                let value_index = column_index(value_column)?;
+                let rows = match indices.entry((table_id.as_str(), match_column.as_str())) {
+                    Entry::Occupied(entry) => Rc::clone(entry.get()),
+                    Entry::Vacant(entry) => {
+                        let rows = Rc::new(index_lookup_rows(table, column_index(match_column)?)?);
+                        entry.insert(Rc::clone(&rows));
+                        rows
+                    }
+                };
+                LookupIndex::Table { rows, table: &table.name, match_column, value_column, value_index }
+            },
+            _ => return Ok(None),
+        };
+        Ok(Some(index))
+    }).collect()
+}
+
+fn row_for(file: &RenameFile, rules: &RenameRules, lookups: &[Option<LookupIndex<'_>>], book: &mut Book, output:&RenameOutput) -> Result<RenameRow> {
     book.configure(rules);
     let mut values = Vec::new();
     for (index, part) in rules.parts.iter().enumerate() {
@@ -208,10 +331,13 @@ fn row_for(file: &RenameFile, rules: &RenameRules, lookups: &[HashMap<&str, &str
                 if let Some(d) = decimals { format!("{:.*}", *d as usize, numeric(&c)?) } else { c.text().trim().into() }
             },
             RenamePart::Text { text } => text.clone(),
-            RenamePart::Lookup { source, fallback, .. } => {
-                let key = book.cell(source)?.text();
-                lookups[index].get(key.trim()).map(|v| (*v).to_owned()).or_else(|| fallback.clone().filter(|s| !s.trim().is_empty()))
-                    .ok_or_else(|| AppError::new("LOOKUP", format!("对照表找不到“{}”，请补充对照信息", key.trim())))?
+            RenamePart::Lookup { source, fallback, .. } | RenamePart::TableLookup { source, fallback, .. } => {
+                let text = book.cell(source)?.text();
+                let key = text.trim();
+                let lookup = lookups[index].as_ref().expect("lookup index prepared for every lookup part");
+                let matched = lookup.value(key);
+                matched.filter(|v| !v.is_empty()).or_else(|| fallback.as_deref().filter(|v| !v.trim().is_empty()))
+                    .ok_or_else(|| lookup.missing(source, key, matched.is_some()))?.to_owned()
             },
             RenamePart::Condition { condition, text } => if book.condition(condition)? { text.clone() } else { String::new() },
         };
@@ -335,19 +461,21 @@ impl RenameService {
         })
     }
     pub fn live(&self, file_id: &str, rules: &RenameRules) -> Result<RenameRow> {
-        validate_rules(rules)?; let file = self.file(file_id)?;
-        Ok(self.cached(&file, |book| row_for(&file, rules, &lookup_tables(rules), book,&RenameOutput::default())).unwrap_or_else(|e| failed_row(&file,e)))
+        validate_rules(rules)?;
+        let lookups = lookup_tables(rules)?;
+        let file = self.file(file_id)?;
+        Ok(self.cached(&file, |book| row_for(&file, rules, &lookups, book,&RenameOutput::default())).unwrap_or_else(|e| failed_row(&file,e)))
     }
     pub fn prepare(&self, ids: Vec<String>, rules: RenameRules) -> Result<RenamePlan> {
         self.prepare_to(ids,rules,RenameOutput::default())
     }
     pub fn prepare_to(&self, ids:Vec<String>,rules:RenameRules,output:RenameOutput) -> Result<RenamePlan> {
         validate_rules(&rules)?;
+        let lookups = lookup_tables(&rules)?;
         let output=normalize_output(output)?;
         let _job = self.begin("核对全部文件名", ids.len())?;
         *self.plan.lock().unwrap() = None; *self.book.lock().unwrap() = None;
         let mut rows = Vec::new(); let mut stamps = HashMap::new(); let mut seen = HashSet::new();
-        let lookups = lookup_tables(&rules);
         for file_id in ids {
             if !seen.insert(file_id.clone()) { continue; }
             if self.cancelled.load(Ordering::SeqCst) { return Err(AppError::new("CANCELLED", "已停止核对，没有修改文件")); }
@@ -366,6 +494,7 @@ impl RenameService {
         let value_labels = rules.parts.iter().map(|p| match p {
             RenamePart::Cell { source, .. } => format!("{}!{}",source.sheet,reader::cell_address(source.row,source.column)),
             RenamePart::Lookup { name, .. } => if name.is_empty() { "对照信息".into() } else { name.clone() },
+            RenamePart::TableLookup { value_column, .. } => value_column.clone(),
             RenamePart::Text { .. } => "固定文字".into(), RenamePart::Condition { .. } => "条件标签".into(),
         }).collect();
         let plan = RenamePlan { id:id(), rows, journal_path:None, value_labels,output };

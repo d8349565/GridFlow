@@ -58,7 +58,7 @@ try {
   await delay(800); // Initial autosave has a 450 ms debounce.
   assert.equal(path.normalize((await ipc("workspace")).dataDirectory), path.normalize(data));
   await page.screenshot({ path: path.join(root, "before.png") });
-  await page.getByRole("button", { name: "添加文件", exact: true }).first().click();
+  await page.getByRole("button", { name: "添加文件，开始汇总", exact: true }).click();
   const cancel = page.getByRole("button", { name: "取消导入", exact: true });
   await expect(cancel).toBeVisible({ timeout: 3000 });
   const progress = page.getByRole("progressbar", { name: "文件导入进度" });
@@ -88,6 +88,40 @@ try {
   assert(complete.files.every(file => file.sheets.length === 1 && file.sheets[0].rows === 81 && file.sheets[0].width === 24));
   report.resumeMs = Math.round(performance.now() - started);
   report.checks.push("all 300 files remain complete after cancellation and resume");
+  let current;
+  for (let attempt = 0; attempt < 60; attempt++) {
+    current = await ipc("workspace");
+    if (current.rules.fileSelections.filter(file => file.enabled).length === 300) break;
+    await delay(50);
+  }
+  assert.equal(current.rules.fileSelections.filter(file => file.enabled).length, 300, "wait for the UI's saved selection, rather than reusing the import-completion snapshot");
+  const rules = { ...current.rules, mergeMode: "single", includeSource: false };
+  report.maxWindowResponseDuringSaveMs = 0;
+  for (let index = 0; index < 20; index++) {
+    const saving = ipc("save_scheme", { name: "window-response-" + index, rules });
+    saving.catch(() => {});
+    await delay(10);
+    const ping = performance.now();
+    await Promise.race([
+      ipc("plugin:window|inner_size", { label: "main" }),
+      delay(2000).then(() => { throw Error("saving a populated workspace blocked the native window for over 2s"); }),
+    ]);
+    report.maxWindowResponseDuringSaveMs = Math.max(report.maxWindowResponseDuringSaveMs, performance.now() - ping);
+    await saving;
+  }
+  const task = await ipc("submit_task", { rules });
+  let completedTask;
+  for (let attempt = 0; attempt < 1200; attempt++) {
+    const currentTask = (await ipc("tasks")).find(item => item.id === task.id);
+    assert(!["failed", "cancelled", "interrupted"].includes(currentTask.state), JSON.stringify(currentTask));
+    if (currentTask.state === "succeeded") { completedTask = currentTask; break; }
+    await delay(50);
+  }
+  assert(completedTask, "full merge did not finish");
+  const merged = (await ipc("workspace")).datasets.find(item => item.id === completedTask.datasetId);
+  assert.equal(merged.summary.outputRows, 24000);
+  assert.equal(merged.columns.length, 24);
+  report.checks.push("native window remains responsive during 20 saved schemes and full 24000-row merge");
   await expect(page.locator(".excel-cell[data-cell='A2']")).toBeVisible();
   await page.screenshot({ path: path.join(root, "complete.png") });
   await page.setViewportSize({ width: 1024, height: 640 });

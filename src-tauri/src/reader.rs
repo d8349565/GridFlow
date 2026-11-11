@@ -391,25 +391,23 @@ pub fn suggest_type(values: &[Cell]) -> ColumnType {
     }
     // 编号的前导零是数据，类型建议也不能将它当成可删除的格式。
     if values.iter().any(|v|matches!(v,Cell::Text(s) if s.trim().chars().all(|c|c.is_ascii_digit()) && ((s.trim().starts_with('0') && s.trim().len()>1)||s.trim().len()>15))) {return ColumnType::Text;}
-    if values
-        .iter()
-        .filter(|v| matches!(v, Cell::Date(_)) || parse_date(&v.text()).is_some())
-        .count()
-        * 5
-        >= values.len() * 4
-    {
+    if matches_type_threshold(&values, |value| matches!(value, Cell::Date(_)) || parse_date(&value.text()).is_some()) {
         return ColumnType::Date;
     }
-    if values
-        .iter()
-        .filter(|v| parse_number(&v.text()).is_some())
-        .count()
-        * 5
-        >= values.len() * 4
-    {
+    if matches_type_threshold(&values, |value| parse_number(&value.text()).is_some()) {
         return ColumnType::Number;
     }
     ColumnType::Text
+}
+fn matches_type_threshold(values: &[&Cell], is_match: impl Fn(&Cell) -> bool) -> bool {
+    let required = (values.len() * 4).div_ceil(5);
+    let mut matches = 0;
+    for (index, value) in values.iter().enumerate() {
+        matches += usize::from(is_match(value));
+        if matches >= required { return true; }
+        if matches + values.len() - index - 1 < required { return false; }
+    }
+    false
 }
 pub fn suggest_column_type(name: &str, values: &[Cell]) -> ColumnType {
     let trimmed = name.trim();

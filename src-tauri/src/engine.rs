@@ -60,6 +60,17 @@ impl Engine {
             workspace.rules.merge_mode = Some("bySheet".into());
             workspace
         };
+        {
+            let mut statement = connection.prepare("SELECT value FROM meta WHERE starts_with(key,'pending_import:') ORDER BY key")?;
+            let pending = statement.query_map([], |row| row.get::<_, String>(0))?
+                .collect::<duckdb::Result<Vec<_>>>()?;
+            for saved in pending {
+                let file: SourceFile = serde_json::from_str(&saved)?;
+                if !workspace.files.iter().any(|existing| existing.id == file.id) {
+                    register_imported_file(&mut workspace, &file);
+                }
+            }
+        }
         // 兼容开发期间已有的 v2 数据表；保留原文本，并补充独立数值投影。
         for dataset in &workspace.datasets {
             for i in 0..dataset.columns.len() {
@@ -131,10 +142,15 @@ impl Engine {
         }
     }
     fn persist_locked(&self, ws: &Workspace) -> Result<()> {
-        self.conn()?.execute(
+        let mut connection = self.conn()?;
+        let transaction = connection.transaction()?;
+        transaction.execute(
             "INSERT OR REPLACE INTO meta VALUES ('workspace', ?)",
             params![serde_json::to_string(ws)?],
         )?;
+        // The complete snapshot replaces import records only after both changes commit.
+        transaction.execute("DELETE FROM meta WHERE starts_with(key,'pending_import:')", [])?;
+        transaction.commit()?;
         Ok(())
     }
     fn persist(&self) -> Result<()> {
@@ -316,6 +332,10 @@ impl Engine {
         progress.cancelled = self.import_cancelled.load(Ordering::SeqCst) && progress.done < progress.total;
         progress.phase = if progress.cancelled { "已停止导入" } else { "导入完成" }.into();
         progress.current.clear();
+        drop(progress);
+        if items.iter().any(|item| item.file.is_some()) {
+            self.persist()?;
+        }
         Ok(items)
     }
     pub fn load_sample_files(&self) -> Result<Vec<ImportItem>> {
@@ -423,8 +443,7 @@ SPU-201,精品挂耳咖啡包,咖啡周边,220,68,14960,2
             })();
             match parsed {
                 Ok(sheets) => {
-                    conn.execute_batch("COMMIT")?;
-                    Ok(SourceFile {
+                    let file = SourceFile {
                         id: file_id.clone(),
                         name: path
                             .file_name()
@@ -436,7 +455,16 @@ SPU-201,精品挂耳咖啡包,咖啡周边,220,68,14960,2
                         stored_path: stored.to_string_lossy().into(),
                         encoding,
                         sheets,
-                    })
+                    };
+                    let mut ws = self.workspace.lock().unwrap();
+                    // Keep each completed file recoverable without rewriting the growing workspace.
+                    conn.execute(
+                        "INSERT INTO meta VALUES (?, ?)",
+                        params![format!("pending_import:{:020}:{}", ws.files.len(), file.id), serde_json::to_string(&file)?],
+                    )?;
+                    conn.execute_batch("COMMIT")?;
+                    register_imported_file(&mut ws, &file);
+                    Ok(file)
                 }
                 Err(e) => {
                     let _ = conn.execute_batch("ROLLBACK");
@@ -445,34 +473,7 @@ SPU-201,精品挂耳咖啡包,咖啡周边,220,68,14960,2
             }
         })();
         match result {
-            Ok(file) => {
-                let mut ws = self.workspace.lock().unwrap();
-                let first = file.sheets.iter().find(|s| s.width > 0 && s.rows > 0).map(|s| &s.id);
-                for sheet in &file.sheets {
-                    ws.rules.sources.push(SourceSelection {
-                        sheet_id: sheet.id.clone(),
-                        enabled: Some(&sheet.id) == first,
-                        header_row: 1,
-                        header_range: None,
-                        source_name: format!("{} / {}", file.name, sheet.name),
-                    });
-                }
-                ws.rules.file_selections.push(FileSelection { file_id: file.id.clone(), enabled: true });
-                if workflow::mode(&ws.rules) == "legacy" {
-                    let new_sources = ws.rules.sources.iter().filter(|s| file.sheets.iter().any(|sheet| sheet.id == s.sheet_id)).cloned().collect::<Vec<_>>();
-                    for output in &mut ws.rules.output_sheets {
-                        for mut source in new_sources.clone() { source.enabled = false; output.rules.sources.push(source); }
-                    }
-                }
-                if ws.active_sheet_id.is_none() {
-                    ws.active_sheet_id = file.sheets.first().map(|s| s.id.clone());
-                }
-                activity(&mut ws, "导入文件", &file.name);
-                ws.files.push(file.clone());
-                ws.rules = workflow::normalize(ws.rules.clone(), &ws.files);
-                self.persist_locked(&ws)?;
-                Ok(file)
-            }
+            Ok(file) => Ok(file),
             Err(e) => {
                 let _ = std::fs::remove_file(stored);
                 Err(e)
@@ -927,12 +928,14 @@ SPU-201,精品挂耳咖啡包,咖啡周边,220,68,14960,2
         }
         self.persist_locked(&ws)
     }
-    fn update_task(&self, task_id: &str, f: impl FnOnce(&mut Task)) {
+    fn update_task(&self, task_id: &str, persist: bool, f: impl FnOnce(&mut Task)) {
         let mut ws = self.workspace.lock().unwrap();
         if let Some(task) = ws.tasks.iter_mut().find(|t| t.id == task_id) {
             f(task);
         }
-        let _ = self.persist_locked(&ws);
+        if persist {
+            let _ = self.persist_locked(&ws);
+        }
     }
     fn execute_task(&self, task_id: &str) {
         let _gate = self.heavy.lock().unwrap();
@@ -954,12 +957,13 @@ SPU-201,精品挂耳咖啡包,咖啡周边,220,68,14960,2
             .get(task_id)
             .cloned()
             .unwrap_or_default();
-        self.update_task(task_id, |t| {
+        self.update_task(task_id, true, |t| {
             t.state = TaskState::Running;
             t.phase = "准备处理".into();
         });
         let result = self.process_outputs(&task.rules, &flag, |percent, message| {
-            self.update_task(task_id, |t| {
+            // Full-workspace writes here retain old JSON versions throughout the merge transaction.
+            self.update_task(task_id, false, |t| {
                 t.progress = percent;
                 t.phase = message.into();
             })
@@ -984,7 +988,7 @@ SPU-201,精品挂耳咖啡包,咖啡周边,220,68,14960,2
                 }
                 let _ = self.persist_locked(&ws);
             }
-            Err(error) => self.update_task(task_id, |t| {
+            Err(error) => self.update_task(task_id, true, |t| {
                 t.state = if error.code == "CANCELLED" {
                     TaskState::Cancelled
                 } else {
@@ -1759,6 +1763,30 @@ SPU-201,精品挂耳咖啡包,咖啡周边,220,68,14960,2
         self.persist_locked(&ws)
     }
 }
+fn register_imported_file(ws: &mut Workspace, file: &SourceFile) {
+    let first = file.sheets.iter().find(|sheet| sheet.width > 0 && sheet.rows > 0).map(|sheet| &sheet.id);
+    for sheet in &file.sheets {
+        ws.rules.sources.push(SourceSelection {
+            sheet_id: sheet.id.clone(),
+            enabled: Some(&sheet.id) == first,
+            header_row: 1,
+            header_range: None,
+            source_name: format!("{} / {}", file.name, sheet.name),
+        });
+    }
+    ws.rules.file_selections.push(FileSelection { file_id: file.id.clone(), enabled: true });
+    if workflow::mode(&ws.rules) == "legacy" {
+        let sources = ws.rules.sources.iter().filter(|source| file.sheets.iter().any(|sheet| sheet.id == source.sheet_id)).cloned().collect::<Vec<_>>();
+        for output in &mut ws.rules.output_sheets {
+            for mut source in sources.clone() { source.enabled = false; output.rules.sources.push(source); }
+        }
+    }
+    if ws.active_sheet_id.is_none() { ws.active_sheet_id = file.sheets.first().map(|sheet| sheet.id.clone()); }
+    activity(ws, "导入文件", &file.name);
+    ws.files.push(file.clone());
+    ws.rules = workflow::normalize(ws.rules.clone(), &ws.files);
+}
+
 pub(crate) fn create_table(
     conn: &Connection,
     table: &str,

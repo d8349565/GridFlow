@@ -20,7 +20,7 @@ fn fixture(path: &Path, code: &str) {
     book.save(path).unwrap();
 }
 fn rules() -> RenameRules {
-    RenameRules { parts:vec![RenamePart::Cell { source:cell("说明",1,1),decimals:None }],separator:"_".into(),prefix:String::new(),suffix:String::new(),checks:vec![] }
+    RenameRules { parts:vec![RenamePart::Cell { source:cell("说明",1,1),decimals:None }],separator:"_".into(),prefix:String::new(),suffix:String::new(),checks:vec![],lookup_tables:vec![] }
 }
 
 #[test]
@@ -219,6 +219,53 @@ fn optional_lookup_checks_and_conditions_use_actual_workbooks() {
     assert_eq!(fs::read(&path).unwrap(),original,"previews must never rewrite Excel content");
     r.parts.push(RenamePart::Cell { source:cell("缺少工作表",1,1),decimals:None });
     assert_eq!(service.live(&files[0].id,&r).unwrap().state,"skipped");
+}
+
+#[test]
+fn shared_lookup_table_matches_different_columns_and_survives_column_reorder() {
+    let temp = isolated();
+    let path = temp.path().join("原名.xlsx");
+    let mut book = Workbook::new();
+    let sheet = book.add_worksheet();
+    sheet.set_name("说明").unwrap();
+    sheet.write_string(0, 0, "001").unwrap();
+    sheet.write_string(0, 1, "T-02").unwrap();
+    book.save(&path).unwrap();
+    let service = RenameService::default();
+    let file = service.scan(vec![path.to_string_lossy().into()], false).unwrap().files.remove(0);
+
+    let binding = |column, match_column: &str, value_column: &str| RenamePart::TableLookup {
+        source: cell("说明", 1, column),
+        table_id: "items".into(),
+        match_column: match_column.into(),
+        value_column: value_column.into(),
+        fallback: None,
+    };
+    let mut r = rules();
+    r.parts = vec![binding(1, "料号", "品名"), binding(1, "料号", "类别"), binding(2, "条码", "料号")];
+    r.lookup_tables = vec![RenameLookupTable {
+        id: "items".into(),
+        name: "示例产品".into(),
+        columns: ["类别", "条码", "品名", "料号"].map(str::to_owned).into(),
+        rows: vec![
+            ["通用", "T-01", "零件甲", "001"].map(str::to_owned).into(),
+            ["通用", "T-02", "零件乙", "1"].map(str::to_owned).into(),
+        ],
+    }];
+    assert_eq!(service.live(&file.id, &r).unwrap().new_name, "零件甲_通用_1.xlsx");
+    r.lookup_tables[0].columns.swap(0, 3);
+    for row in &mut r.lookup_tables[0].rows { row.swap(0, 3); }
+    r.lookup_tables[0].rows[0][2] = "新名称".into();
+    let plan = service.prepare(vec![file.id.clone()], r.clone()).unwrap();
+    assert_eq!(plan.rows[0].new_name, "新名称_通用_1.xlsx");
+    assert_eq!(plan.value_labels, ["品名", "类别", "料号"]);
+
+    r.lookup_tables[0].rows[0][2].clear();
+    let row = service.live(&file.id, &r).unwrap();
+    assert_eq!(row.state, "skipped");
+    assert!(row.message.contains("「品名」为空"));
+    r.lookup_tables[0].rows[1][0] = "001".into();
+    assert!(service.live(&file.id, &r).unwrap_err().message.contains("重复值“001”"));
 }
 
 #[test]

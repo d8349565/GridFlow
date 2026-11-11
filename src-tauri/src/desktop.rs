@@ -180,16 +180,19 @@ async fn preview_rules(core: Core<'_>, rules: RuleSet) -> Result<Dataset> {
         .map_err(join_error)?
 }
 #[tauri::command]
-fn submit_task(core: Core<'_>, rules: RuleSet) -> Result<Task> {
-    core.submit(rules)
+async fn submit_task(core: Core<'_>, rules: RuleSet) -> Result<Task> {
+    let core = core.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || core.submit(rules)).await.map_err(join_error)?
 }
 #[tauri::command]
-fn retry_task(core: Core<'_>, task_id: String) -> Result<Task> {
-    core.retry(&task_id)
+async fn retry_task(core: Core<'_>, task_id: String) -> Result<Task> {
+    let core = core.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || core.retry(&task_id)).await.map_err(join_error)?
 }
 #[tauri::command]
-fn cancel_task(core: Core<'_>, task_id: String) -> Result<()> {
-    core.cancel(&task_id)
+async fn cancel_task(core: Core<'_>, task_id: String) -> Result<()> {
+    let core = core.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || core.cancel(&task_id)).await.map_err(join_error)?
 }
 #[tauri::command]
 async fn tasks(core: Core<'_>) -> Result<Vec<Task>> {
@@ -230,16 +233,19 @@ async fn issues(core: Core<'_>, dataset_id: String, offset: usize) -> Result<Vec
         .map_err(join_error)?
 }
 #[tauri::command]
-fn save_scheme(core: Core<'_>, name: String, rules: RuleSet) -> Result<Scheme> {
-    core.save_scheme(name, rules)
+async fn save_scheme(core: Core<'_>, name: String, rules: RuleSet) -> Result<Scheme> {
+    let core = core.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || core.save_scheme(name, rules)).await.map_err(join_error)?
 }
 #[tauri::command]
-fn rename_scheme(core: Core<'_>, scheme_id: String, name: String) -> Result<Scheme> {
-    core.rename_scheme(&scheme_id, name)
+async fn rename_scheme(core: Core<'_>, scheme_id: String, name: String) -> Result<Scheme> {
+    let core = core.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || core.rename_scheme(&scheme_id, name)).await.map_err(join_error)?
 }
 #[tauri::command]
-fn apply_scheme(core: Core<'_>, scheme_id: String, rules: RuleSet) -> Result<RuleSet> {
-    core.apply_scheme(&scheme_id, rules)
+async fn apply_scheme(core: Core<'_>, scheme_id: String, rules: RuleSet) -> Result<RuleSet> {
+    let core = core.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || core.apply_scheme(&scheme_id, rules)).await.map_err(join_error)?
 }
 #[tauri::command]
 async fn import_scheme(core: Core<'_>, path: String) -> Result<Scheme> {
@@ -249,8 +255,9 @@ async fn import_scheme(core: Core<'_>, path: String) -> Result<Scheme> {
         .map_err(join_error)?
 }
 #[tauri::command]
-fn export_scheme(core: Core<'_>, scheme_id: String, path: String) -> Result<()> {
-    core.export_scheme(scheme_id, path)
+async fn export_scheme(core: Core<'_>, scheme_id: String, path: String) -> Result<()> {
+    let core = core.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || core.export_scheme(scheme_id, path)).await.map_err(join_error)?
 }
 #[tauri::command]
 async fn import_results(core: Core<'_>, paths: Vec<String>) -> Result<Vec<Dataset>> {
