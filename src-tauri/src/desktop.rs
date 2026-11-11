@@ -301,11 +301,14 @@ async fn export_batch(
     .map_err(join_error)?
 }
 #[tauri::command]
-fn save_image(core: Core<'_>, path: String, bytes: Vec<u8>, dataset_id: Option<String>) -> Result<String> {
-    if let Some(id) = &dataset_id { core.dataset(id)?; }
-    let saved = core.save_image(path, bytes)?;
-    if let Some(id) = dataset_id { core.record_export(&id, &PathBuf::from(&saved))?; }
-    Ok(saved)
+async fn save_image(core: Core<'_>, path: String, bytes: Vec<u8>, dataset_id: Option<String>) -> Result<String> {
+    let core = core.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Some(id) = &dataset_id { core.dataset(id)?; }
+        let saved = core.save_image(path, bytes)?;
+        if let Some(id) = dataset_id { core.record_export(&id, &PathBuf::from(&saved))?; }
+        Ok(saved)
+    }).await.map_err(join_error)?
 }
 #[tauri::command]
 async fn delete_items(core: Core<'_>, kind: String, ids: Vec<String>) -> Result<()> {
@@ -333,8 +336,9 @@ fn lock(core: Core<'_>) -> Result<()> {
     core.lock()
 }
 #[tauri::command]
-fn disk_usage(core: Core<'_>) -> Result<u64> {
-    core.disk_usage()
+async fn disk_usage(core: Core<'_>) -> Result<u64> {
+    let core = core.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || core.disk_usage()).await.map_err(join_error)?
 }
 #[tauri::command]
 fn open_path(core: Core<'_>, path: String, select: bool) -> Result<()> {

@@ -35,6 +35,9 @@ struct LookupIndex<'a> {
 }
 type FixedValue = (Cell, String, usize, usize, String, Option<String>);
 type FixedCache = HashMap<(String, String, String), FixedValue>;
+#[cfg(test)]
+#[path = "bounded_reads_tests.rs"]
+mod bounded_reads_tests;
 impl Engine {
     pub fn open(root: &Path) -> Result<Arc<Self>> {
         std::fs::create_dir_all(root.join("imports"))?;
@@ -1355,175 +1358,190 @@ SPU-201,精品挂耳咖啡包,咖啡周边,220,68,14960,2
                     fixed.insert(key, value);
                 }
                 let lookups = self.lookup_indices(&conn, rules, &sheet, &raw_columns, &files, cancel, started)?;
+                let start_column = source.header_range.as_ref().map(|area| area.start_column - 1).unwrap_or(0);
+                // Keep every column in the selected range: skipped columns still affect empty-row detection.
+                let selection = (start_column..start_column + raw_columns.len())
+                    .flat_map(|i| [format!("c{i}"), format!("t{i}")]).collect::<Vec<_>>().join(",");
                 let sql = format!(
-                    "SELECT * FROM r_{} WHERE _row>? ORDER BY _row {}",
-                    sheet.id,
-                    if sample { "LIMIT 200" } else { "" }
+                    "SELECT _row,{selection} FROM r_{} WHERE _row IN (SELECT _row FROM r_{} WHERE _row>? ORDER BY _row LIMIT ?) ORDER BY _row",
+                    sheet.id, sheet.id
                 );
                 let mut statement = conn.prepare(&sql)?;
-                let mut cursor = statement.query(params![source.header_row as i64])?;
-                while let Some(row) = cursor.next()? {
-                    if sequence % 256 == 0 {
-                        check_cancel(cancel, started)?;
-                    }
-                    let source_row = row.get::<_, i64>(0)? as usize;
-                    let raw = (0..sheet.width)
-                        .map(|i| cell_from_row(row, 1 + 2 * i))
-                        .collect::<Result<Vec<_>>>()?;
-                    let raw = if let Some(area) = &source.header_range { raw[area.start_column-1..area.end_column].to_vec() } else { raw };
-                    summary.input_rows += 1;
-                    let empty = if rules.empty_columns.is_empty() {
-                        raw.iter().all(|c| c.text().trim().is_empty())
-                    } else {
-                        rules.empty_columns.iter().all(|key| {
-                            names
-                                .iter()
-                                .position(|k| reader::same_key(k, key))
-                                .and_then(|i| raw.get(i))
-                                .is_none_or(|c| c.text().trim().is_empty())
-                        })
-                    };
-                    if rules.remove_empty_rows && empty {
-                        summary.empty_removed += 1;
-                        continue;
-                    }
-                    let mut cells = Vec::new();
-                    let mut numbers = Vec::new();
-                    let mut extra = fixed.clone();
-                    let mut lookup_errors = HashMap::new();
-                    for lookup in &lookups {
-                        let source_column = lookup.source_column + source.header_range.as_ref().map(|r| r.start_column).unwrap_or(1);
-                        let key = padded_identifier(&raw[lookup.source_column], padded.get(&(source_row, source_column)).copied()).text().trim().to_string();
-                        let output_key = format!("lookup:{}", lookup.rule.id);
-                        if let Some((value, row)) = lookup.values.get(&key) {
-                            extra.insert(output_key, (value.clone(), lookup.sheet.id.clone(), *row, lookup.value_column + 1, lookup.sheet.name.clone(), None));
-                        } else {
-                            let message = format!("关联值「{key}」在 {} 中未匹配到，补充列已留空", lookup.sheet.name);
-                            if lookup.rule.missing_strategy == "error" {
-                                return Err(AppError::new("LOOKUP_MISSING", format!("{} 第 {source_row} 行：{message}", sheet.name)));
-                            }
-                            lookup_errors.insert(output_key.clone(), message);
-                            extra.insert(output_key, (Cell::Empty, sheet.id.clone(), source_row, source_column, sheet.name.clone(), None));
+                // Bound both rows and cells, including wide sheets, without changing transaction atomicity.
+                let batch_size = (16_384 / raw_columns.len().max(1)).clamp(1, 2048);
+                let mut last_row = source.header_row;
+                let mut remaining = if sample { 200 } else { usize::MAX };
+                while remaining > 0 {
+                    check_cancel(cancel, started)?;
+                    let limit = remaining.min(batch_size);
+                    let mut fetched = 0;
+                    let mut cursor = statement.query(params![last_row as i64, limit as i64])?;
+                    while let Some(row) = cursor.next()? {
+                        if sequence % 256 == 0 {
+                            check_cancel(cancel, started)?;
                         }
-                    }
-                    for column in &columns {
-                        let mut raw_cell = if column.key == "__source" {
-                            Cell::Text(source.source_name.clone())
-                        } else if let Some(value) = extra.get(&column.key) {
-                            value.0.clone()
+                        let source_row = row.get::<_, i64>(0)? as usize;
+                        last_row = source_row;
+                        fetched += 1;
+                        let raw = (0..raw_columns.len())
+                            .map(|i| cell_from_row(row, 1 + 2 * i))
+                            .collect::<Result<Vec<_>>>()?;
+                        summary.input_rows += 1;
+                        let empty = if rules.empty_columns.is_empty() {
+                            raw.iter().all(|c| c.text().trim().is_empty())
                         } else {
-                            names
-                                .iter()
-                                .position(|k| k == &column.key)
-                                .and_then(|i| raw.get(i))
-                                .cloned()
-                                .unwrap_or(Cell::Empty)
+                            rules.empty_columns.iter().all(|key| {
+                                names
+                                    .iter()
+                                    .position(|k| reader::same_key(k, key))
+                                    .and_then(|i| raw.get(i))
+                                    .is_none_or(|c| c.text().trim().is_empty())
+                            })
                         };
-                        if [ColumnType::Auto,ColumnType::Text].contains(&column.data_type) {
-                            if let Some(i)=names.iter().position(|k|k==&column.key) {
-                                if raw_columns[i].suggested_type==ColumnType::Text {
-                                    let c=i+source.header_range.as_ref().map(|r|r.start_column).unwrap_or(1);
-                                    raw_cell=padded_identifier(&raw_cell,padded.get(&(source_row,c)).copied());
+                        if rules.remove_empty_rows && empty {
+                            summary.empty_removed += 1;
+                            continue;
+                        }
+                        let mut cells = Vec::new();
+                        let mut numbers = Vec::new();
+                        let mut extra = fixed.clone();
+                        let mut lookup_errors = HashMap::new();
+                        for lookup in &lookups {
+                            let source_column = lookup.source_column + source.header_range.as_ref().map(|r| r.start_column).unwrap_or(1);
+                            let key = padded_identifier(&raw[lookup.source_column], padded.get(&(source_row, source_column)).copied()).text().trim().to_string();
+                            let output_key = format!("lookup:{}", lookup.rule.id);
+                            if let Some((value, row)) = lookup.values.get(&key) {
+                                extra.insert(output_key, (value.clone(), lookup.sheet.id.clone(), *row, lookup.value_column + 1, lookup.sheet.name.clone(), None));
+                            } else {
+                                let message = format!("关联值「{key}」在 {} 中未匹配到，补充列已留空", lookup.sheet.name);
+                                if lookup.rule.missing_strategy == "error" {
+                                    return Err(AppError::new("LOOKUP_MISSING", format!("{} 第 {source_row} 行：{message}", sheet.name)));
+                                }
+                                lookup_errors.insert(output_key.clone(), message);
+                                extra.insert(output_key, (Cell::Empty, sheet.id.clone(), source_row, source_column, sheet.name.clone(), None));
+                            }
+                        }
+                        for column in &columns {
+                            let mut raw_cell = if column.key == "__source" {
+                                Cell::Text(source.source_name.clone())
+                            } else if let Some(value) = extra.get(&column.key) {
+                                value.0.clone()
+                            } else {
+                                names
+                                    .iter()
+                                    .position(|k| k == &column.key)
+                                    .and_then(|i| raw.get(i))
+                                    .cloned()
+                                    .unwrap_or(Cell::Empty)
+                            };
+                            if [ColumnType::Auto,ColumnType::Text].contains(&column.data_type) {
+                                if let Some(i)=names.iter().position(|k|k==&column.key) {
+                                    if raw_columns[i].suggested_type==ColumnType::Text {
+                                        let c=i+source.header_range.as_ref().map(|r|r.start_column).unwrap_or(1);
+                                        raw_cell=padded_identifier(&raw_cell,padded.get(&(source_row,c)).copied());
+                                    }
                                 }
                             }
-                        }
-                        let mut cell = raw_cell.clone();
-                        let mut error = lookup_errors.get(&column.key).cloned();
-                        if matches!(&raw_cell,Cell::Text(s) if s=="#公式无缓存"||s.starts_with("#Excel错误:"))
-                        {
-                            error = Some(
-                                "源单元格没有有效缓存值，请在 Excel 中重新计算并保存".to_string(),
-                            );
-                        }
-                        if !matches!(raw_cell, Cell::Empty) {
-                            let auto_hint = original
+                            let mut cell = raw_cell.clone();
+                            let mut error = lookup_errors.get(&column.key).cloned();
+                            if matches!(&raw_cell,Cell::Text(s) if s=="#公式无缓存"||s.starts_with("#Excel错误:"))
+                            {
+                                error = Some(
+                                    "源单元格没有有效缓存值，请在 Excel 中重新计算并保存".to_string(),
+                                );
+                            }
+                            if !matches!(raw_cell, Cell::Empty) {
+                                let auto_hint = original
+                                    .iter()
+                                    .find(|c| c.key == column.key)
+                                    .map(|c| &c.suggested_type);
+                                let ty = if column.data_type == ColumnType::Auto
+                                    && rules.clean_numeric
+                                    && auto_hint == Some(&ColumnType::Number)
+                                {
+                                    ColumnType::Number
+                                } else if column.data_type == ColumnType::Auto
+                                    && rules.parse_dates
+                                    && auto_hint == Some(&ColumnType::Date)
+                                {
+                                    ColumnType::Date
+                                } else {
+                                    column.data_type.clone()
+                                };
+                                match reader::convert_cell(
+                                    &raw_cell,
+                                    &ty,
+                                    rules
+                                        .date_formats
+                                        .iter()
+                                        .find(|(key, _)| reader::same_key(key, &column.key))
+                                        .map(|(_, value)| value.as_str())
+                                        .unwrap_or("auto"),
+                                ) {
+                                    Ok(converted) => cell = converted,
+                                    Err(message) => error = Some(message),
+                                }
+                            }
+                            if let Some(message) = error {
+                                summary.issue_count += 1;
+                                let (issue_sheet, issue_row, issue_col, issue_sheet_name) =
+                                    if let Some(value) = extra.get(&column.key) {
+                                        (value.1.clone(), value.2, value.3, value.4.clone())
+                                    } else {
+                                        (
+                                            sheet.id.clone(),
+                                            source_row,
+                                            names
+                                                .iter()
+                                                .position(|k| k == &column.key)
+                                                .map(|i| i + source.header_range.as_ref().map(|r| r.start_column).unwrap_or(1))
+                                                .unwrap_or(1),
+                                            sheet.name.clone(),
+                                        )
+                                    };
+                                let file_name = files
+                                    .iter()
+                                    .find(|f| f.id == sheet.file_id)
+                                    .map(|f| f.name.clone())
+                                    .unwrap_or_default();
+                                issue_writer.append_row(params![
+                                    dataset_id,
+                                    sheet.file_id,
+                                    issue_sheet,
+                                    issue_row as i64,
+                                    column.name,
+                                    raw_cell.text(),
+                                    message,
+                                    issue_col as i64,
+                                    file_name,
+                                    issue_sheet_name
+                                ])?;
+                            }
+                            let hint = original
                                 .iter()
                                 .find(|c| c.key == column.key)
                                 .map(|c| &c.suggested_type);
-                            let ty = if column.data_type == ColumnType::Auto
-                                && rules.clean_numeric
-                                && auto_hint == Some(&ColumnType::Number)
-                            {
-                                ColumnType::Number
-                            } else if column.data_type == ColumnType::Auto
-                                && rules.parse_dates
-                                && auto_hint == Some(&ColumnType::Date)
-                            {
-                                ColumnType::Date
+                            let numeric = column.data_type == ColumnType::Number
+                                || (column.data_type == ColumnType::Auto
+                                    && hint == Some(&ColumnType::Number));
+                            numbers.push(if numeric {
+                                reader::parse_number(&cell.text())
                             } else {
-                                column.data_type.clone()
-                            };
-                            match reader::convert_cell(
-                                &raw_cell,
-                                &ty,
-                                rules
-                                    .date_formats
-                                    .iter()
-                                    .find(|(key, _)| reader::same_key(key, &column.key))
-                                    .map(|(_, value)| value.as_str())
-                                    .unwrap_or("auto"),
-                            ) {
-                                Ok(converted) => cell = converted,
-                                Err(message) => error = Some(message),
-                            }
+                                None
+                            });
+                            cells.push(cell);
                         }
-                        if let Some(message) = error {
-                            summary.issue_count += 1;
-                            let (issue_sheet, issue_row, issue_col, issue_sheet_name) =
-                                if let Some(value) = extra.get(&column.key) {
-                                    (value.1.clone(), value.2, value.3, value.4.clone())
-                                } else {
-                                    (
-                                        sheet.id.clone(),
-                                        source_row,
-                                        names
-                                            .iter()
-                                            .position(|k| k == &column.key)
-                                            .map(|i| i + source.header_range.as_ref().map(|r| r.start_column).unwrap_or(1))
-                                            .unwrap_or(1),
-                                        sheet.name.clone(),
-                                    )
-                                };
-                            let file_name = files
-                                .iter()
-                                .find(|f| f.id == sheet.file_id)
-                                .map(|f| f.name.clone())
-                                .unwrap_or_default();
-                            issue_writer.append_row(params![
-                                dataset_id,
-                                sheet.file_id,
-                                issue_sheet,
-                                issue_row as i64,
-                                column.name,
-                                raw_cell.text(),
-                                message,
-                                issue_col as i64,
-                                file_name,
-                                issue_sheet_name
-                            ])?;
-                        }
-                        let hint = original
-                            .iter()
-                            .find(|c| c.key == column.key)
-                            .map(|c| &c.suggested_type);
-                        let numeric = column.data_type == ColumnType::Number
-                            || (column.data_type == ColumnType::Auto
-                                && hint == Some(&ColumnType::Number));
-                        numbers.push(if numeric {
-                            reader::parse_number(&cell.text())
-                        } else {
-                            None
-                        });
-                        cells.push(cell);
+                        sequence += 1;
+                        append_cells(
+                            &mut output,
+                            sequence,
+                            &cells,
+                            columns.len(),
+                            Some((&sheet.file_id, &sheet.id, source_row, &numbers)),
+                        )?;
                     }
-                    sequence += 1;
-                    append_cells(
-                        &mut output,
-                        sequence,
-                        &cells,
-                        columns.len(),
-                        Some((&sheet.file_id, &sheet.id, source_row, &numbers)),
-                    )?;
+                    remaining -= fetched;
+                    if fetched < limit { break; }
                 }
                 progress(
                     (10 + 75 * (source_index + 1) / sources.len()) as u8,
@@ -1859,7 +1877,7 @@ pub(crate) fn read_rows(
     limit: usize,
 ) -> Result<Vec<(usize, Vec<Cell>)>> {
     let mut stmt = conn.prepare(&format!(
-        "SELECT * FROM {table} WHERE _row>? ORDER BY _row LIMIT ?"
+        "SELECT * FROM {table} WHERE _row IN (SELECT _row FROM {table} WHERE _row>? ORDER BY _row LIMIT ?) ORDER BY _row"
     ))?;
     let mut cursor = stmt.query(params![offset as i64, limit as i64])?;
     let mut output = Vec::new();
