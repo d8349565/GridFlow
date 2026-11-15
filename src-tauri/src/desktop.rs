@@ -2,9 +2,45 @@ use crate::{engine::Engine, model::*};
 use std::{path::PathBuf, sync::Arc};
 use tauri::{Manager, State};
 use crate::rename::*;
+use crate::split::*;
 
 type Core<'a> = State<'a, Arc<Engine>>;
 type Renamer<'a> = State<'a, Arc<RenameService>>;
+type Splitter<'a> = State<'a, Arc<SplitService>>;
+#[tauri::command]
+async fn split_import(core: Core<'_>, splitter: Splitter<'_>, path: String) -> Result<SourceFile> {
+    core.guard()?; let core = core.inner().clone(); let splitter = splitter.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || splitter.import_file(&core, &path)).await.map_err(join_error)?
+}
+#[tauri::command]
+async fn split_source_page(core: Core<'_>, splitter: Splitter<'_>, sheet_id: String, offset: usize, limit: usize) -> Result<SplitSourcePage> {
+    core.guard()?; let core = core.inner().clone(); let splitter = splitter.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || splitter.source_page(&core, &sheet_id, offset, limit)).await.map_err(join_error)?
+}
+#[tauri::command]
+async fn split_use_sheet(core: Core<'_>, splitter: Splitter<'_>, sheet_id: String, range: SheetRange) -> Result<Dataset> {
+    core.guard()?; let core = core.inner().clone(); let splitter = splitter.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || splitter.use_sheet(&core, &sheet_id, range)).await.map_err(join_error)?
+}
+#[tauri::command]
+async fn split_prepare(core: Core<'_>, splitter: Splitter<'_>, request: SplitRequest, edits: Vec<SplitEdit>, output: SplitOutput) -> Result<SplitPlan> {
+    core.guard()?; let core = core.inner().clone(); let splitter = splitter.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || splitter.prepare(&core, request, edits, output)).await.map_err(join_error)?
+}
+#[tauri::command]
+async fn split_page(core: Core<'_>, splitter: Splitter<'_>, plan_id: String, group_id: Option<String>, offset: usize, limit: usize, sorts: Vec<Sort>) -> Result<DataPage> {
+    core.guard()?; let core = core.inner().clone(); let splitter = splitter.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || splitter.page(&core, &plan_id, group_id.as_deref(), offset, limit, sorts)).await.map_err(join_error)?
+}
+#[tauri::command]
+async fn split_execute(core: Core<'_>, splitter: Splitter<'_>, plan_id: String) -> Result<SplitPlan> {
+    core.guard()?; let core = core.inner().clone(); let splitter = splitter.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || splitter.execute(&core, &plan_id)).await.map_err(join_error)?
+}
+#[tauri::command]
+fn split_progress(core: Core<'_>, splitter: Splitter<'_>) -> Result<SplitProgress> { core.guard()?; Ok(splitter.progress()) }
+#[tauri::command]
+fn split_cancel(core: Core<'_>, splitter: Splitter<'_>) -> Result<()> { core.guard()?; splitter.cancel(); Ok(()) }
 #[tauri::command]
 async fn rename_presets(core:Core<'_>) -> Result<Vec<crate::rename_config::RenamePresetSummary>> {
     core.guard()?;let core=core.inner().clone();
@@ -341,7 +377,7 @@ async fn disk_usage(core: Core<'_>) -> Result<u64> {
     tauri::async_runtime::spawn_blocking(move || core.disk_usage()).await.map_err(join_error)?
 }
 #[tauri::command]
-fn open_path(core: Core<'_>, path: String, select: bool) -> Result<()> {
+fn open_path(core: Core<'_>, splitter: Splitter<'_>, path: String, select: bool) -> Result<()> {
     if path.starts_with("http://") || path.starts_with("https://") {
         #[cfg(windows)]
         {
@@ -362,6 +398,7 @@ fn open_path(core: Core<'_>, path: String, select: bool) -> Result<()> {
     let path = PathBuf::from(path);
     let ws = core.snapshot()?;
     if !(path.starts_with(&core.root)
+        || splitter.allows_path(&path)
         || ws
             .datasets
             .iter()
@@ -444,7 +481,9 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
-            app.manage(Engine::open(&root)?);
+            let engine = Engine::open(&root)?;
+            app.manage(Arc::new(SplitService::new(&engine)?));
+            app.manage(engine);
             app.manage(Arc::new(RenameService::default()));
             if let Some(window) = app.get_webview_window("main") {
                 if let Ok(Some(monitor)) = window.current_monitor() {
@@ -458,6 +497,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            split_import, split_source_page, split_use_sheet, split_prepare, split_page, split_execute, split_progress, split_cancel,
             rename_presets, rename_save_preset, rename_load_preset, rename_import_preset,
             rename_save_config, rename_load_config, rename_save_draft, rename_load_draft,
             rename_files, rename_scan, rename_sheet_names, rename_page, rename_live, rename_prepare,

@@ -801,7 +801,7 @@ strong {
 .welcome > * { flex-shrink: 0; }
 .welcome-heading { width: min(840px, 100%); }
 .welcome-kicker { display: block; text-align: center; margin-bottom: 12px; color: #526176; font-size: 12px; }
-.task-choices { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; width: min(840px, 100%); }
+.task-choices { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; width: min(1180px, 100%); }
 .task-choice { display: flex; flex-direction: column; align-items: flex-start; padding: 25px; border: 1px solid #dbe3ee; border-radius: 12px; background: #fff; }
 .task-choice-icon { color: var(--blue); margin-bottom: 18px; }
 .task-choice h2 { font-size: 20px; }

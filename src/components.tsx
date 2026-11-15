@@ -116,6 +116,8 @@ export function Grid({
   load,
   onCell,
   onMove,
+  onSort,
+  initialSorts,
   headerRow,
   version,
   focusRow,
@@ -129,6 +131,8 @@ export function Grid({
   ) => Promise<DataPage>;
   onCell?: (row: number, column: number, value: Cell) => void;
   onMove?: (keys: string[]) => void;
+  onSort?: (sorts: { key: string; descending: boolean }[]) => void;
+  initialSorts?: { key: string; descending: boolean }[];
   headerRow?: number;
   version: string;
   focusRow?: number;
@@ -159,6 +163,8 @@ export function Grid({
         minWidth: 100,
         initialWidth: 160,
         sortable: true,
+        initialSort: initialSorts?.some(s => s.key === c.key) ? initialSorts.find(s => s.key === c.key)!.descending ? "desc" : "asc" : undefined,
+        initialSortIndex: initialSorts?.some(s => s.key === c.key) ? initialSorts.findIndex(s => s.key === c.key) : undefined,
         resizable: true,
         valueFormatter: (p) => cellDisplay(p.value as Cell | undefined),
         tooltipValueGetter: (p) => cellText(p.value as Cell | undefined),
@@ -167,7 +173,7 @@ export function Grid({
         headerTooltip: c.name,
       })),
     ],
-    [JSON.stringify(columns)],
+    [JSON.stringify(columns), JSON.stringify(initialSorts)],
   );
   function position(api: GridApi<GridRow>) {
     if (totalRows) api.setRowCount(totalRows, true);
@@ -225,6 +231,10 @@ export function Grid({
             : undefined
         }
         onGridReady={(e) => install(e.api)}
+        onSortChanged={(e) => onSort?.(e.api.getColumnState()
+          .filter(c => c.sort && c.colId.startsWith("field:"))
+          .sort((a, b) => (a.sortIndex ?? 0) - (b.sortIndex ?? 0))
+          .map(c => ({ key: c.colId.slice(6), descending: c.sort === "desc" })))}
         onCellClicked={(e) => {
           if (!e.data || e.colDef.colId === "__workbench_row") return;
           const key = e.colDef.colId?.slice(6);

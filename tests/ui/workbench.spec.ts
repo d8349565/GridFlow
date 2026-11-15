@@ -23,6 +23,10 @@ test.beforeEach(async ({ page }) => {
     ];
     const rules = {
       version: 2,
+      mergeMode: "single",
+      fileSelections: [],
+      outputSheets: [],
+      lookupColumns: [],
       sources: [],
       columns: [],
       mappings: [],
@@ -48,6 +52,7 @@ test.beforeEach(async ({ page }) => {
       settings: { passwordHash: null, lastExportDirectory: null },
       dataDirectory: "D:\\Excel工作台\\data",
       locked: false,
+      activities: [],
     };
     const calls: any[] = [];
     (window as any).__TEST_CALLS__ = calls;
@@ -59,12 +64,17 @@ test.beforeEach(async ({ page }) => {
         return ["D:\\输入\\一月.xlsx", "D:\\输入\\二月.xlsx"];
       if (command === "plugin:dialog|save") return "D:\\导出\\汇总.xlsx";
       if (command === "workspace") { await new Promise(resolve => setTimeout(resolve, 25)); return structuredClone(ws); }
+      if (command === "import_progress") {
+        if ((window as any).__TEST_PROGRESS_ERROR__) throw { code: "TEST_PROGRESS", message: "进度暂时不可用" };
+        return { busy: false, done: ws.files.length, total: ws.files.length, current: "", phase: "导入完成", cancelled: false };
+      }
       if (command === "save_draft") {
         ws.rules = structuredClone(args.rules);
         ws.activeSheetId = args.activeSheetId;
         return null;
       }
       if (command === "import_files" || command === "load_sample_files") {
+        if ((window as any).__TEST_HOLD_IMPORT__) await new Promise(resolve => { (window as any).__TEST_RELEASE_IMPORT__ = resolve; });
         ws.files = Array.from({ length: (window as any).__TEST_MANY_FILES__ ? 32 : 2 }, (_, index) => index + 1).map((i) => ({
           id: `f${i}`,
           name: `${i}月.xlsx`,
@@ -173,6 +183,7 @@ test.beforeEach(async ({ page }) => {
           finishedAt: null,
           error: null,
           datasetId: null,
+          datasetIds: [],
           rules: args.rules,
         };
         ws.tasks = [task];
@@ -186,6 +197,7 @@ test.beforeEach(async ({ page }) => {
             phase: "处理完成",
             progress: 100,
             datasetId: ws.datasets[0].id,
+            datasetIds: [ws.datasets[0].id],
           };
         }
         return structuredClone(ws.tasks);
@@ -250,6 +262,37 @@ test.beforeEach(async ({ page }) => {
     };
   });
 });
+test("current summary result hands its filter to the independent split tool", async ({ page }) => {
+  const errors: string[] = []; page.on("pageerror", error => errors.push(error.message));
+  await page.goto("/");
+  await page.getByRole("button", { name: "添加文件，开始汇总", exact: true }).click();
+  await expect(page.locator('.excel-cell[data-cell="A1"]')).toBeVisible();
+  await page.getByRole("button", { name: "生成汇总结果", exact: true }).click();
+  await expect(page.locator(".pane-tabs button.active")).toContainText("汇总表", { timeout: 12000 });
+  await page.getByLabel("选择要筛选的列").selectOption("门店");
+  await page.getByLabel("浦东", { exact: true }).check();
+  await page.getByRole("button", { name: "应用筛选", exact: true }).click();
+  await page.getByRole("button", { name: "拆分此表", exact: true }).click();
+  await expect(page.getByRole("navigation", { name: "工具入口" }).getByRole("button", { name: "表格拆分", exact: true })).toHaveAttribute("aria-current", "page");
+  await expect(page.getByLabel("筛选字段 1", { exact: true })).toHaveValue("门店");
+  await expect(page.getByLabel("筛选方式 1", { exact: true })).toHaveValue("in");
+  await expect(page.getByLabel("筛选值 1", { exact: true })).toHaveValue("浦东");
+  await expect(page.getByLabel("拆分字段", { exact: true })).toHaveValue("");
+  expect(errors).toEqual([]);
+});
+
+test("temporary import progress failure does not freeze the summary interface", async ({ page }) => {
+  test.setTimeout(8000);
+  await page.goto("/");
+  await page.evaluate(() => { (window as any).__TEST_HOLD_IMPORT__ = true; (window as any).__TEST_PROGRESS_ERROR__ = true; });
+  await page.getByRole("button", { name: "添加文件，开始汇总", exact: true }).click({ timeout: 4000 });
+  await expect(page.getByText("进度暂时不可用", { exact: true })).toBeVisible();
+  const polls = await page.evaluate(() => (window as any).__TEST_CALLS__.filter((c: any) => c.command === "import_progress").length);
+  expect(polls).toBeLessThanOrEqual(3);
+  await page.evaluate(() => { (window as any).__TEST_PROGRESS_ERROR__ = false; (window as any).__TEST_RELEASE_IMPORT__(); });
+  await expect(page.locator(".file-sidebar")).toBeVisible();
+});
+
 test("layout space for original Excel", async ({ page }) => {
   await page.goto("/");
   await page.getByRole("button", { name: "添加文件", exact: true }).click();

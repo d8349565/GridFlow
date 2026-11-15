@@ -29,7 +29,7 @@ const ruleKey = "gridflow_rename_rules_v1";
 const fileName = (path:string) => path.split(/[\\/]/).at(-1) || path;
 export type RenameSession = { selected: string[]; activeId: string; output?: RenameOutput };
 
-export default function RenameWorkbench({ onBack, onBusy, session, onSessionChange, onFlush }: { onBack: () => void; onBusy: (busy: boolean) => void; session: RenameSession | null; onSessionChange: (session: RenameSession) => void; onFlush: (flush: (() => Promise<void>) | null) => void }) {
+export default function RenameWorkbench({ onBack, onSplit, onBusy, session, onSessionChange, onFlush }: { onBack: () => void; onSplit: () => void; onBusy: (busy: boolean) => void; session: RenameSession | null; onSessionChange: (session: RenameSession) => void; onFlush: (flush: (() => Promise<void>) | null) => void }) {
   const [files, setFiles] = useState<RenameFile[]>([]);
   const [selected, setSelected] = useState<string[]>(session?.selected ?? []);
   const [activeId, setActiveId] = useState(session?.activeId ?? "");
@@ -136,7 +136,7 @@ export default function RenameWorkbench({ onBack, onBusy, session, onSessionChan
     await persistDraft(latestDraft.current.rules);
   }, [persistDraft]);
   useEffect(() => { onFlush(flushDraft); return () => onFlush(null); }, [onFlush,flushDraft]);
-  async function leave() { await run("加密保存规则",async () => { await flushDraft(); onBack(); }); }
+  async function leave(next = onBack) { await run("加密保存规则",async () => { await flushDraft(); next(); }); }
   async function run(name: string, work: () => Promise<void>) {
     if (task.current) return;
     task.current = true; onBusy(true); setBusy(name); setNotice(null); setProgress(null);
@@ -289,7 +289,7 @@ export default function RenameWorkbench({ onBack, onBusy, session, onSessionChan
   async function exportLog() { if (!plan) return; await run("保存日志与汇总", async () => { const path = await savePath(`重命名日志与汇总_${new Date().toISOString().slice(0, 10)}.xlsx`, "xlsx"); if (path) { await call("rename_export", { plan, path }); notify("success","日志与汇总已保存",fileName(path),path); } }); }
 
   return <div className="app-shell rename-shell">
-    <header className="app-header"><div className="brand"><div className="app-mark"><FileSpreadsheet size={18} /></div><strong>汇格 · GridFlow</strong></div><nav className="module-nav" aria-label="工具入口"><button disabled={!!busy} onClick={() => void leave()}>Excel 汇总</button><button className="active" aria-current="page">批量重命名</button></nav><div className="header-actions"><Button className="quiet" icon={Save} disabled={!!busy || !!pick || !draftReady} onClick={() => setPresetDialog("save")}>保存配置</Button><Button className="quiet" icon={FolderOpen} title={currentPreset ? `当前：${currentPreset.name}` : "选择本机已保存的配置，或导入、导出配置"} disabled={!!busy || !!pick || !draftReady} onClick={() => setPresetDialog("list")}>本机配置</Button><Button className="quiet" icon={History} disabled={!!busy} onClick={() => void history()}>上次记录与恢复</Button></div></header>
+    <header className="app-header"><div className="brand"><div className="app-mark"><FileSpreadsheet size={18} /></div><strong>汇格 · GridFlow</strong></div><nav className="module-nav" aria-label="工具入口"><button disabled={!!busy} onClick={() => void leave()}>Excel 汇总</button><button className="active" aria-current="page">批量重命名</button><button disabled={!!busy || !draftReady} onClick={() => void leave(onSplit)}>表格拆分</button></nav><div className="header-actions"><Button className="quiet" icon={Save} disabled={!!busy || !!pick || !draftReady} onClick={() => setPresetDialog("save")}>保存配置</Button><Button className="quiet" icon={FolderOpen} title={currentPreset ? `当前：${currentPreset.name}` : "选择本机已保存的配置，或导入、导出配置"} disabled={!!busy || !!pick || !draftReady} onClick={() => setPresetDialog("list")}>本机配置</Button><Button className="quiet" icon={History} disabled={!!busy} onClick={() => void history()}>上次记录与恢复</Button></div></header>
     <WorkflowBar label="重命名步骤" current={view === "review" ? 2 : selected.length ? 1 : 0} steps={[
       {label:"添加文件", disabled:!!busy || !!pick, onClick:() => { if(view === "review") setView("configure"); else void choose(false); }},
       {label:"组成文件名", disabled:!!busy || !!pick || !files.length, onClick:() => { setView("configure"); }},

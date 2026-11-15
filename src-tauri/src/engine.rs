@@ -1969,7 +1969,7 @@ fn check_cancel(cancel: &AtomicBool, started: Instant) -> Result<()> {
     }
 }
 
-fn padded_identifier(cell:&Cell,width:Option<usize>)->Cell {
+pub(crate) fn padded_identifier(cell:&Cell,width:Option<usize>)->Cell {
     if let (Cell::Number(n),Some(width))=(cell,width) {
         if *n>=0. && *n<=9_007_199_254_740_991. && n.fract()==0. {
             return Cell::Text(format!("{:0width$}",*n as u64));

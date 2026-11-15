@@ -55,6 +55,7 @@ import {
   Home,
   RotateCcw,
   CheckCircle2,
+  Scissors,
 } from "lucide-react";
 import rewardQrCode from "./assets/reward_qr.webp";
 import appIcon from "./assets/app_icon.png";
@@ -72,6 +73,7 @@ import { activeOutputs, applyFirstFileSettings, editConfiguration, executionRule
 import OnboardingTour from "./OnboardingTour";
 import HelpModal from "./HelpModal";
 import WorkflowBar from "./WorkflowBar";
+import SplitWorkbench, { splitSessionForDataset, type SplitSession } from "./SplitWorkbench";
 import {
   call,
   chooseFiles,
@@ -199,11 +201,13 @@ function rulesReducer(
   };
 }
 export default function App() {
-  const [tool, setTool] = useState<"summary" | "rename">("summary");
+  const [tool, setTool] = useState<"summary" | "rename" | "split">("summary");
   const toolRef = useRef(tool); toolRef.current = tool;
   const renameBusy = useRef(false);
   const renameFlush = useRef<(() => Promise<void>) | null>(null);
   const renameSession = useRef<RenameSession | null>(null);
+  const splitBusy = useRef(false);
+  const splitSession = useRef<SplitSession | null>(null);
   const [ws, setWs] = useState<Workspace | null>(null);
   const [rulesState, dispatch] = useReducer(rulesReducer, {
     current: defaultRules(),
@@ -371,8 +375,8 @@ export default function App() {
     window
       .onCloseRequested(async (event) => {
         event.preventDefault();
-        if (renameBusy.current) {
-          globalThis.dispatchEvent(new Event("gridflow-rename-close-blocked"));
+        if (renameBusy.current || splitBusy.current) {
+          globalThis.dispatchEvent(new Event(splitBusy.current ? "gridflow-split-close-blocked" : "gridflow-rename-close-blocked"));
           return;
         }
         if (toolRef.current === "rename") {
@@ -477,13 +481,13 @@ export default function App() {
   const selectedSheetNames = [...new Set(selectedItems.map((item) => item.sheet.name))];
 
 
-  function error(error: unknown) {
+  const error = useCallback((error: unknown) => {
     const message =
       typeof error === "object" && error !== null && "message" in error
         ? String((error as AppError).message)
         : String(error);
     setNotice({ message, error: true });
-  }
+  }, []);
   async function action<T>(
     name: string,
     work: () => Promise<T>,
@@ -1261,7 +1265,16 @@ export default function App() {
         </div>
       </div>
     );
-  if (tool === "rename") return <RenameWorkbench onBack={() => setTool("summary")} onBusy={(busy) => { renameBusy.current = busy; }} session={renameSession.current} onSessionChange={(next) => { renameSession.current = next; }} onFlush={(flush) => { renameFlush.current=flush; }} />;
+  function openSplit(from?: DatasetQuery) {
+    if (from) {
+      const source = ws?.datasets.find(d => d.id === from.datasetId && !d.sample);
+      if (!source) return;
+      splitSession.current = splitSessionForDataset(source, from);
+    }
+    setTourActive(false); setModal(null); setTool("split");
+  }
+  if (tool === "split") return <SplitWorkbench datasets={ws?.datasets ?? []} session={splitSession.current} onSessionChange={next => { splitSession.current = next; }} onBusy={value => { splitBusy.current = value; }} onNavigate={next => { setTool(next); void refresh(); }} />;
+  if (tool === "rename") return <RenameWorkbench onBack={() => setTool("summary")} onSplit={() => openSplit()} onBusy={(busy) => { renameBusy.current = busy; }} session={renameSession.current} onSessionChange={(next) => { renameSession.current = next; }} onFlush={(flush) => { renameFlush.current=flush; }} />;
   return (
     <div className="app-shell">
       <header className="app-header">
@@ -1276,7 +1289,7 @@ export default function App() {
           </div>
           <strong>汇格 · GridFlow</strong>
         </button>
-        <nav className="module-nav" aria-label="工具入口"><button className={!isHome ? "active" : ""} aria-current={!isHome ? "page" : undefined} onClick={returnToConfig}>Excel 汇总</button><button disabled={!!busy || !!running || !ws} onClick={() => { setTourActive(false); setModal(null); setTool("rename"); }}>批量重命名</button></nav>
+        <nav className="module-nav" aria-label="工具入口"><button className={!isHome ? "active" : ""} aria-current={!isHome ? "page" : undefined} onClick={returnToConfig}>Excel 汇总</button><button disabled={!!busy || !!running || !ws} onClick={() => { setTourActive(false); setModal(null); setTool("rename"); }}>批量重命名</button><button disabled={!!busy || !!running || !ws} onClick={() => openSplit()}>表格拆分</button></nav>
         <div className="header-actions">
           {phase === "configure" && !!ws?.files.length && !isHome && <>
             <div className="edit-actions">
@@ -1317,6 +1330,7 @@ export default function App() {
         actions={phase === "configure" ? <Button data-tour="preview-btn" icon={Play} primary disabled={!hasSources || !!outputProblem || !!busy || !!running} title={outputProblem || undefined} loading={busy === "提交任务"} onClick={() => void generate()}>生成汇总结果</Button>
             : tab !== "pivot" && tab !== "chart" ? <>
               {staleResult && <Button icon={RefreshCw} primary disabled={!!busy || !hasSources || !!outputProblem} onClick={() => void generate()}>按当前配置刷新结果</Button>}
+              {tab === "result" && dataset && !dataset.sample && <Button icon={Scissors} disabled={!!busy || !!running} onClick={() => openSplit({ ...query, datasetId: dataset.id })}>拆分此表</Button>}
               <select aria-label="导出格式" value={exportFormat} onChange={(e) => setExportFormat(e.target.value)}><option value="xlsx">Excel</option><option value="csv">CSV</option></select>
               <Button icon={Download} primary={!staleResult} disabled={!dataset || !!busy} loading={busy === "导出" || busy === "导出多表 Excel"} onClick={() => void (tab !== "preview" && exportFormat === "xlsx" && resultSetIds.length > 1 && !query.filters.length && !query.search ? exportWorkbook(resultSetIds) : exportCurrent())}>{query.filters.length || query.search ? "保存筛选后的表格" : tab !== "preview" && exportFormat === "xlsx" && resultSetIds.length > 1 ? `保存全部 ${resultSetIds.length} 张表到 Excel` : staleResult ? "保存此版本" : "保存到电脑"}</Button>
             </> : null} />}
@@ -1477,6 +1491,16 @@ export default function App() {
                   <div className="task-choice-actions">
                     <Button icon={ArrowRight} disabled={!!busy || !!running || !ws} onClick={() => { setTourActive(false); setModal(null); setTool("rename"); }}>开始批量重命名</Button>
                     <small>表格内容保持原样</small>
+                  </div>
+                </section>
+                <section className="task-choice">
+                  <div className="task-choice-icon"><Scissors size={24} aria-hidden="true" /></div>
+                  <h2>按分类拆分表格</h2>
+                  <p>把一张总表按部门、门店等字段拆成多个文件，自定义名称，核对后批量导出。</p>
+                  <ol className="task-choice-steps"><li>选择总表</li><li>设置分类与命名</li><li>核对并导出</li></ol>
+                  <div className="task-choice-actions">
+                    <Button icon={ArrowRight} disabled={!!busy || !!running || !ws} onClick={() => openSplit()}>开始表格拆分</Button>
+                    <small>支持汇总结果和已有 Excel</small>
                   </div>
                 </section>
               </div>

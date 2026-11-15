@@ -188,7 +188,7 @@ fn sorted_export(conn: &duckdb::Connection, ds: &Dataset, query: &DatasetQuery) 
     ), params_from_iter(args))?;
     Ok(sorted)
 }
-fn export_conditions(ds: &Dataset, query: &DatasetQuery) -> Result<(String, Vec<duckdb::types::Value>)> {
+pub(crate) fn export_conditions(ds: &Dataset, query: &DatasetQuery) -> Result<(String, Vec<duckdb::types::Value>)> {
     let (condition, args) = conditions(ds, query)?;
     if query.search.trim().is_empty() { return Ok((condition, args)); }
     let mut without_search = query.clone();
@@ -202,7 +202,7 @@ fn export_conditions(ds: &Dataset, query: &DatasetQuery) -> Result<(String, Vec<
     filter_args.extend(args.into_iter().skip(filter_count));
     Ok((format!("{base}{} _row IN ({matches})", if base.is_empty() { " WHERE" } else { " AND" }), filter_args))
 }
-fn export_rows<'a>(conn: &'a duckdb::Connection, mut batches: duckdb::ArrowStream<'a>, dataset_id: &str, indices: &[usize]) -> impl FnMut() -> Option<Result<Vec<Cell>>> + 'a {
+pub(crate) fn export_rows<'a>(conn: &'a duckdb::Connection, mut batches: duckdb::ArrowStream<'a>, dataset_id: &str, indices: &[usize]) -> impl FnMut() -> Option<Result<Vec<Cell>>> + 'a {
     let table = format!("d_{dataset_id}");
     let width = indices.len();
     let indices = indices.to_vec();
@@ -265,7 +265,7 @@ fn export_rows<'a>(conn: &'a duckdb::Connection, mut batches: duckdb::ArrowStrea
         }
     }
 }
-fn write_rows(
+pub(crate) fn write_rows(
     temp: &Path,
     path: &Path,
     columns: &[Column],
@@ -403,7 +403,7 @@ fn safe_name(s: &str) -> String {
         })
         .collect()
 }
-fn temporary(path: &Path) -> Result<PathBuf> {
+pub(crate) fn temporary(path: &Path) -> Result<PathBuf> {
     let parent = path
         .parent()
         .ok_or_else(|| AppError::new("EXPORT", "导出路径无效"))?;

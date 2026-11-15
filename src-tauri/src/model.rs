@@ -510,6 +510,7 @@ pub fn id() -> String {
 
 pub fn generate_types(path: &std::path::Path) -> std::io::Result<()> {
     use crate::rename::*;
+    use crate::split::*;
     use crate::rename_config::{RenamePreset, RenamePresetSummary};
     use std::fmt::Write;
     let mut text = String::from("// Generated from Rust DTOs. Run npm run types; do not edit.\n");
@@ -555,7 +556,8 @@ pub fn generate_types(path: &std::path::Path) -> std::io::Result<()> {
         AppError,
         RenameCell, RenameArea, RenameCondition, RenameLookupEntry, RenameLookupTable, RenamePart,
         RenameSum, RenameCheck, RenameRules, RenameFile, RenameScan, RenamePage,
-        RenameRow, RenamePlan, RenameProgress, RenamePreset, RenamePresetSummary, RenameOutput, RenameOutputMode
+        RenameRow, RenamePlan, RenameProgress, RenamePreset, RenamePresetSummary, RenameOutput, RenameOutputMode,
+        SplitNamePart, SplitRequest, SplitOutput, SplitEdit, SplitGroup, SplitPlan, SplitProgress, SplitSourcePage
     );
     std::fs::create_dir_all(path.parent().unwrap())?;
     std::fs::write(path, text)

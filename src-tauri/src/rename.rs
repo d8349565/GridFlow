@@ -646,7 +646,7 @@ fn number_targets(rows:&mut [RenameRow],output:&RenameOutput)->Result<()> {
 fn state_label(state: &str) -> &str { match state { "ready" => "待执行", "renamed" => "已重命名", "copied"=>"已复制", "moved"=>"已移动", "copyOnly"=>"副本已保存，原文件保留", "restored" => "已撤销", "unchanged" => "无需修改", "skipped" => "已跳过", "cancelled" => "未执行", "undoFailed" => "撤销失败", "failed" => "失败", _ => "需人工核对" } }
 fn write_record(file: &mut File, value: &impl Serialize) -> Result<()> { serde_json::to_writer(&mut *file,value)?; file.write_all(b"\n")?; file.sync_data()?; Ok(()) }
 fn write_event(file: &mut File, row: &RenameRow, state: &str, message: &str) -> Result<()> { write_record(file, &JournalEvent { id:row.id.clone(),state:state.into(),message:message.into(),target_stamp:None,restored_stamp:None }) }
-fn move_no_replace(source: &Path, target: &Path) -> std::io::Result<()> {
+pub(crate) fn move_no_replace(source: &Path, target: &Path) -> std::io::Result<()> {
     // Deliberately omit MOVEFILE_REPLACE_EXISTING: an existence check alone races.
     #[cfg(windows)]
     let result = {

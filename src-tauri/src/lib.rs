@@ -10,6 +10,7 @@ pub mod reader;
 pub mod rename;
 mod rename_read;
 pub mod rename_config;
+pub mod split;
 pub mod appearance;
 mod xls_appearance;
 #[cfg(feature = "desktop")]
